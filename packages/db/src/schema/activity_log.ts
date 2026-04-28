@@ -1,4 +1,5 @@
-import { pgTable, uuid, text, timestamp, jsonb, index } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import { pgTable, uuid, text, timestamp, jsonb, index, uniqueIndex } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import { agents } from "./agents.js";
 import { heartbeatRuns } from "./heartbeat_runs.js";
@@ -22,5 +23,8 @@ export const activityLog = pgTable(
     companyCreatedIdx: index("activity_log_company_created_idx").on(table.companyId, table.createdAt),
     runIdIdx: index("activity_log_run_id_idx").on(table.runId),
     entityIdx: index("activity_log_entity_type_id_idx").on(table.entityType, table.entityId),
+    runLifecycleActionUq: uniqueIndex("activity_log_run_lifecycle_action_uq")
+      .on(table.runId, table.action)
+      .where(sql`${table.runId} IS NOT NULL AND ${table.action} IN ('agent.run.started', 'agent.run.finished', 'agent.run.failed', 'agent.run.cancelled')`),
   }),
 );

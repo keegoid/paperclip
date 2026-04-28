@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX "activity_log_run_lifecycle_action_uq" ON "activity_log" USING btree ("run_id","action") WHERE "activity_log"."run_id" IS NOT NULL AND "activity_log"."action" IN ('agent.run.started', 'agent.run.finished', 'agent.run.failed', 'agent.run.cancelled');

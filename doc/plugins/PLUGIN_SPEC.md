@@ -789,9 +789,21 @@ Each event must include:
 - event id
 - event type
 - occurred at
-- actor metadata when applicable
-- primary entity metadata
+- company id
+- entity id/type when applicable
+- actor id/type when applicable
 - typed payload
+
+Run lifecycle events (`agent.run.started`, `agent.run.finished`,
+`agent.run.failed`, `agent.run.cancelled`) use `run` as the primary
+entity and include the run id, agent id, status transition, invocation
+metadata, timestamps, error fields when applicable, and compact usage /
+result summaries when available. Timed-out runs are delivered as
+`agent.run.failed` with `status: "timed_out"` and `errorCode: "timeout"`;
+`agent.run.finished` is success-only, so terminal-state consumers should
+subscribe to `agent.run.finished`, `agent.run.failed`, and
+`agent.run.cancelled`. These four lifecycle actions are also the actions
+covered by the activity-log idempotency constraint.
 
 ### 16.1 Event Filtering
 
