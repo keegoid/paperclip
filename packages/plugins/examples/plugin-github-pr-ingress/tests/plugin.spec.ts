@@ -87,7 +87,7 @@ function harnessForRepo(companyId = randomUUID()) {
 describe("github pr ingress plugin", () => {
   it("declares the webhook and issue sync capabilities", () => {
     expect(pluginManifestV1Schema.parse(manifest)).toMatchObject({
-      id: "keegoid.paperclip-plugin-github-pr-ingress",
+      id: "keegoid.plugin-github-pr-ingress",
       capabilities: expect.arrayContaining([
         "webhooks.receive",
         "secrets.read-ref",

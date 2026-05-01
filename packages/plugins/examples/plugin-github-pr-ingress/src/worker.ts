@@ -10,7 +10,7 @@ import {
 import type { Issue } from "@paperclipai/shared";
 
 const WEBHOOK_KEY = "github-pull-request";
-const ORIGIN_KIND = "plugin:keegoid.paperclip-plugin-github-pr-ingress:github-pr" as const;
+const ORIGIN_KIND = "plugin:keegoid.plugin-github-pr-ingress:github-pr" as const;
 
 type IssuePriority = Issue["priority"];
 type IssueStatus = Issue["status"];

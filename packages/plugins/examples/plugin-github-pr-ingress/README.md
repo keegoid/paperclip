@@ -5,11 +5,11 @@ Syncs GitHub `pull_request` webhooks into Paperclip issues.
 ## What It Does
 
 - Receives GitHub webhooks at
-  `/api/plugins/keegoid.paperclip-plugin-github-pr-ingress/webhooks/github-pull-request`
+  `/api/plugins/keegoid.plugin-github-pr-ingress/webhooks/github-pull-request`
 - Verifies `X-Hub-Signature-256` with a Paperclip secret UUID
 - Maps configured `owner/repo` names to Paperclip companies
 - Creates or updates one issue per PR using origin
-  `plugin:keegoid.paperclip-plugin-github-pr-ingress:github-pr`
+  `plugin:keegoid.plugin-github-pr-ingress:github-pr`
 - Stores delivery and PR sync state for idempotency
 
 This plugin only observes PRs. The post-D4 routine that runs
@@ -51,7 +51,7 @@ pnpm test
 ```bash
 curl -X POST http://127.0.0.1:3100/api/plugins/install \
   -H "Content-Type: application/json" \
-  -d '{"packageName":"/Users/kmullaney/repos/paperclip/packages/plugins/examples/paperclip-plugin-github-pr-ingress","isLocalPath":true}'
+  -d '{"packageName":"/Users/kmullaney/repos/paperclip/packages/plugins/examples/plugin-github-pr-ingress","isLocalPath":true}'
 ```
 
 ## Build Options

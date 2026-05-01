@@ -1,5 +1,5 @@
 {
-  "name": "@keegoid/paperclip-plugin-github-pr-ingress",
+  "name": "@keegoid/plugin-github-pr-ingress",
   "version": "0.1.0",
   "type": "module",
   "private": true,

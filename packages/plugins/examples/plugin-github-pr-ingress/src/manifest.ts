@@ -1,7 +1,7 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 
 const manifest: PaperclipPluginManifestV1 = {
-  id: "keegoid.paperclip-plugin-github-pr-ingress",
+  id: "keegoid.plugin-github-pr-ingress",
   apiVersion: 1,
   version: "0.1.0",
   displayName: "GitHub PR Ingress",
