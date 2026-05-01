@@ -166,7 +166,26 @@ When creating a pull request (via `gh pr create` or any other method), you **mus
 - **Model Used** — the AI model that produced or assisted with the change (provider, exact model ID, context window, capabilities). Write "None — human-authored" if no AI was used.
 - **Checklist** — all items checked
 
-## 11. Definition of Done
+## 11. Branch Hygiene
+
+Treat `upstream/master` as the canonical local base for feature work.
+Before starting or refreshing a Codex feature branch, update local
+`master` and rebase the feature branch onto it:
+
+```sh
+git fetch --all --prune
+git switch master
+git branch --set-upstream-to=upstream/master master
+git merge --ff-only upstream/master
+git switch codex/<branch>
+git rebase master
+```
+
+Use the fork remote (`origin`) for publishing Codex feature branches,
+but do not use `origin/master` as a rebase base unless it is known to
+match `upstream/master`.
+
+## 12. Definition of Done
 
 A change is done when all are true:
 
@@ -176,7 +195,7 @@ A change is done when all are true:
 4. Docs updated when behavior or commands change
 5. PR description follows the [PR template](.github/PULL_REQUEST_TEMPLATE.md) with all sections filled in (including Model Used)
 
-## 11. Fork-Specific: HenkDz/paperclip
+## 13. Fork-Specific: HenkDz/paperclip
 
 This is a fork of `paperclipai/paperclip` with QoL patches and an **external-only** Hermes adapter story on branch `feat/externalize-hermes-adapter` ([tree](https://github.com/HenkDz/paperclip/tree/feat/externalize-hermes-adapter)).
 
