@@ -908,13 +908,11 @@ function defaultUserBinDirs(env: NodeJS.ProcessEnv): string[] {
   if (process.platform === "win32") return [];
 
   const envHome = typeof env.HOME === "string" ? env.HOME.trim() : "";
-  const processHome = typeof process.env.HOME === "string" ? process.env.HOME.trim() : "";
-  const home = envHome || processHome;
-  if (!home) return [];
+  if (!envHome) return [];
 
   return [
-    path.join(home, ".local", "bin"),
-    path.join(home, "bin"),
+    path.join(envHome, ".local", "bin"),
+    path.join(envHome, "bin"),
   ];
 }
 

@@ -95,6 +95,17 @@ describe("ensurePathInEnv", () => {
       await fs.rm(home, { recursive: true, force: true });
     }
   });
+
+  it.skipIf(process.platform === "win32")("does not inherit host user bin directories when HOME is omitted", () => {
+    const env = ensurePathInEnv({
+      PATH: ["/usr/bin", "/bin"].join(path.delimiter),
+    });
+
+    expect(env.PATH?.split(path.delimiter)).toEqual([
+      "/usr/bin",
+      "/bin",
+    ]);
+  });
 });
 
 describe("materializePaperclipSkillCopy", () => {

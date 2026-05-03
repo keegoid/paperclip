@@ -1352,7 +1352,7 @@ export function pluginLoader(
       if (escalated.length > 0) {
         log.warn(
           { pluginId, escalated, oldVersion: oldManifest.version, newVersion: newManifest.version },
-          "plugin-loader: upgrade introduces new capabilities; lifecycle will require approval before activation",
+          "plugin-loader: upgrade introduces new capabilities; pluginLifecycleManager.upgrade will move the plugin to upgrade_pending before activation",
         );
       }
 
