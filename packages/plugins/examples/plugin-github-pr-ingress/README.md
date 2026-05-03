@@ -49,9 +49,10 @@ pnpm test
 ## Install Into Paperclip
 
 ```bash
+PLUGIN_PATH="$(git rev-parse --show-toplevel)/packages/plugins/examples/plugin-github-pr-ingress"
 curl -X POST http://127.0.0.1:3100/api/plugins/install \
   -H "Content-Type: application/json" \
-  -d '{"packageName":"/Users/kmullaney/repos/paperclip/packages/plugins/examples/plugin-github-pr-ingress","isLocalPath":true}'
+  -d "{\"packageName\":\"${PLUGIN_PATH}\",\"isLocalPath\":true}"
 ```
 
 ## Build Options
