@@ -311,6 +311,7 @@ export type {
   JsonSchema,
   PluginJobDeclaration,
   PluginWebhookDeclaration,
+  PluginWebhookHostPrefilterDeclaration,
   PluginToolDeclaration,
   PluginEnvironmentDriverDeclaration,
   PluginUiSlotDeclaration,

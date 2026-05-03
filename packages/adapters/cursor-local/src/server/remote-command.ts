@@ -16,8 +16,7 @@ function hasPathSeparator(command: string): boolean {
 }
 
 function prependPosixPathEntry(pathValue: string, entry: string): string {
-  const parts = pathValue.split(":").filter(Boolean);
-  if (parts.includes(entry)) return pathValue;
+  const parts = pathValue.split(":").filter((part) => part.length > 0 && part !== entry);
   const cleaned = parts.join(":");
   return cleaned.length > 0 ? `${entry}:${cleaned}` : entry;
 }

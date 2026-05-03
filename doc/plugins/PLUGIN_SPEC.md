@@ -919,8 +919,30 @@ Rules:
 1. The host owns the public route.
 2. The worker receives the request body through `handleWebhook`.
 3. Signature verification happens in plugin code using secret refs resolved by the host.
-4. Every delivery is recorded.
-5. Webhook handling must be idempotent.
+4. Webhook declarations may opt into a host-side `hostPrefilter` for defense in depth.
+   Host prefilters reject invalid traffic before Paperclip records a delivery row, but
+   plugins must still verify signatures in `handleWebhook`.
+5. Every accepted delivery is recorded.
+6. Webhook handling must be idempotent.
+
+Supported host prefilter:
+
+```ts
+webhooks: [
+  {
+    endpointKey: "github-pull-request",
+    displayName: "GitHub Pull Request",
+    hostPrefilter: {
+      kind: "github-hmac-sha256",
+      secretRefConfigKey: "githubWebhookSecretRef",
+      // Optional; defaults to x-hub-signature-256.
+      signatureHeader: "x-hub-signature-256",
+      // Optional; defaults to 1 MiB.
+      maxBodyBytes: 1048576,
+    },
+  },
+]
+```
 
 ## 19. UI Extension Model
 
