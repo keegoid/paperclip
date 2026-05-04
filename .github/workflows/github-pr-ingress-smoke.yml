@@ -87,4 +87,6 @@ jobs:
 
       - name: Run plugin smoke
         working-directory: paperclip
-        run: pnpm run smoke:github-pr-ingress-plugin -- --plugin-dir "../keegoid-plugin-source/${{ inputs.plugin_path || 'org/paperclip-plugins/keegoid-pi-github-pr-ingress' }}"
+        env:
+          PLUGIN_PATH: ${{ inputs.plugin_path || 'org/paperclip-plugins/keegoid-pi-github-pr-ingress' }}
+        run: pnpm run smoke:github-pr-ingress-plugin -- --plugin-dir "../keegoid-plugin-source/${PLUGIN_PATH}"

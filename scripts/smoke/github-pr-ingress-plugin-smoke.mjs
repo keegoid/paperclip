@@ -120,6 +120,7 @@ async function stagePlugin(pluginDir, stageRoot) {
 
 function smokeSpecSource() {
   return `import { createHmac, randomUUID } from "node:crypto";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { createTestHarness } from "@paperclipai/plugin-sdk/testing";
 import manifest from "../src/manifest.js";
@@ -134,8 +135,26 @@ import plugin, {
 const secretRef = "github-webhook-secret";
 const resolvedSecret = \`resolved:\${secretRef}\`;
 const repository = "keegoidllc/agentic-strategy-designer";
-const localRepoPath = "/Users/kmullaney/keegoid/repos/agentic-strategy-designer";
-const agentPrFlowPath = "/Users/kmullaney/keegoid/ops/bin/agent-pr-flow";
+const fixtureRoot = path.join(process.cwd(), "paperclip smoke 'fixtures'");
+const localRepoPath = path.join(fixtureRoot, "repos", "agentic-strategy-designer");
+const agentPrFlowPath = path.join(fixtureRoot, "ops", "bin", "agent-pr-flow");
+
+function shellQuote(value: string) {
+  return "'" + value.replace(/'/g, "'\\\\''") + "'";
+}
+
+function expectedReviewCommand() {
+  return [
+    shellQuote(agentPrFlowPath),
+    "review",
+    "--repo",
+    shellQuote(localRepoPath),
+    "--pr",
+    shellQuote("https://github.com/" + repository + "/pull/42"),
+    "--author",
+    shellQuote("codex"),
+  ].join(" ");
+}
 
 function payload(action = "opened", overrides: Record<string, unknown> = {}) {
   return {
@@ -293,9 +312,7 @@ describe("GitHub PR ingress Paperclip CI smoke", () => {
       originId: \`\${repository}#42@def456:keegoid-cc\`,
     });
     expect(issues).toHaveLength(1);
-    expect(issues[0]?.description).toContain(
-      "'/Users/kmullaney/keegoid/ops/bin/agent-pr-flow' review --repo '/Users/kmullaney/keegoid/repos/agentic-strategy-designer' --pr 'https://github.com/keegoidllc/agentic-strategy-designer/pull/42' --author 'codex'",
-    );
+    expect(issues[0]?.description).toContain(expectedReviewCommand());
   });
 });
 `;
