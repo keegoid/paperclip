@@ -535,7 +535,7 @@ class IssueChatMessageErrorBoundary extends Component<
   }
 
   override componentDidUpdate(prevProps: IssueChatMessageErrorBoundaryProps): void {
-    if (this.state.hasError && prevProps.message !== this.props.message) {
+    if (this.state.hasError && prevProps.message.id !== this.props.message.id) {
       this.setState({ hasError: false });
     }
   }

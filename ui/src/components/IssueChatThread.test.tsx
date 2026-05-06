@@ -1657,6 +1657,10 @@ describe("IssueChatThread", () => {
       expect(container.textContent).toContain(issueChatRendererCrashSentinel);
       expect(container.textContent).toContain("QA follow-up: messages after the failing row");
       expect(container.textContent).not.toContain("Chat renderer hit an internal state error.");
+      expect(consoleErrorSpy).toHaveBeenCalledWith(
+        expect.stringContaining("Issue chat message failed to render"),
+        expect.objectContaining({ messageId: expect.any(String) }),
+      );
     } finally {
       act(() => {
         root.unmount();
