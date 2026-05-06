@@ -58,6 +58,76 @@ type LogEntry = {
   chunk: string;
 };
 
+function parseStdoutJsonLogs(logs: LogEntry[]): Array<Record<string, unknown>> {
+  return logs
+    .filter((entry) => entry.stream === "stdout")
+    .flatMap((entry) => entry.chunk.split(/\r?\n/))
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .flatMap((line) => {
+      try {
+        return [JSON.parse(line) as Record<string, unknown>];
+      } catch {
+        return [];
+      }
+    });
+}
+
+async function executeWithCapturedLogs(input: {
+  rootPrefix: string;
+  runId: string;
+  context: Record<string, unknown>;
+}): Promise<LogEntry[]> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), input.rootPrefix));
+  const workspace = path.join(root, "workspace");
+  const commandPath = path.join(root, "codex");
+  await fs.mkdir(workspace, { recursive: true });
+  await writeFakeCodexCommand(commandPath);
+
+  const previousHome = process.env.HOME;
+  const previousCodexHome = process.env.CODEX_HOME;
+  process.env.HOME = root;
+  delete process.env.CODEX_HOME;
+
+  const logs: LogEntry[] = [];
+  try {
+    await execute({
+      runId: input.runId,
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "Codex Coder",
+        adapterType: "codex_local",
+        adapterConfig: {},
+      },
+      runtime: {
+        sessionId: null,
+        sessionParams: null,
+        sessionDisplayId: null,
+        taskKey: null,
+      },
+      config: {
+        command: commandPath,
+        cwd: workspace,
+        promptTemplate: "Follow the paperclip heartbeat.",
+      },
+      context: input.context,
+      authToken: "run-jwt-token",
+      onLog: async (stream, chunk) => {
+        logs.push({ stream, chunk });
+      },
+      onMeta: async () => {},
+    });
+    return logs;
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previousCodexHome;
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}
+
 function createLocalSandboxRunner() {
   let counter = 0;
   return {
@@ -93,6 +163,53 @@ function createLocalSandboxRunner() {
 }
 
 describe("codex execute", () => {
+  it("emits a structured no_work line for unscoped timer fires before invoking Codex", async () => {
+    const logs = await executeWithCapturedLogs({
+      rootPrefix: "paperclip-codex-exec-timer-no-work-",
+      runId: "run-codex-timer-no-work",
+      context: {
+        wakeSource: "timer",
+        wakeReason: "heartbeat_timer",
+      },
+    });
+
+    const firstStdout = parseStdoutJsonLogs(logs)[0];
+    expect(firstStdout).toBeTruthy();
+    expect(firstStdout).toMatchObject({
+      event: "no_work",
+      reason: "timer_no_scoped_work",
+      adapter: "codex_local",
+      runId: "run-codex-timer-no-work",
+    });
+  });
+
+  it.each([
+    {
+      name: "a scoped timer issue wake",
+      context: { wakeSource: "timer", wakeReason: "heartbeat_timer", issueId: "issue-1" },
+    },
+    {
+      name: "a non-timer wake source",
+      context: { wakeSource: "comment", wakeReason: "issue_commented" },
+    },
+    {
+      name: "an empty wake source",
+      context: { wakeSource: "", wakeReason: "" },
+    },
+  ])("does not emit the timer no_work line for $name", async ({ context }) => {
+    const logs = await executeWithCapturedLogs({
+      rootPrefix: "paperclip-codex-exec-no-timer-no-work-",
+      runId: "run-codex-no-timer-no-work",
+      context,
+    });
+
+    const stdoutEvents = parseStdoutJsonLogs(logs);
+    expect(stdoutEvents[0]).toMatchObject({ type: "thread.started" });
+    expect(
+      stdoutEvents.some((event) => event.event === "no_work" && event.reason === "timer_no_scoped_work"),
+    ).toBe(false);
+  });
+
   it("uses a Paperclip-managed CODEX_HOME outside worktree mode while preserving shared auth and config", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-execute-default-"));
     const workspace = path.join(root, "workspace");
