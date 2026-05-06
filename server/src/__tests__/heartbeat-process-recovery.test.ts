@@ -30,6 +30,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { runningProcesses } from "../adapters/index.ts";
+import { DETACHED_PROCESS_ACTIVITY_CLEARED_MESSAGE } from "../services/local-run-events.ts";
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 const mockTrackAgentFirstHeartbeat = vi.hoisted(() => vi.fn());
 const mockAdapterExecute = vi.hoisted(() =>
@@ -393,6 +394,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     includeIssue?: boolean;
     runErrorCode?: string | null;
     runError?: string | null;
+    startedAt?: Date | null;
+    processStartedAt?: Date | null;
+    lastOutputAt?: Date | null;
+    createdAt?: Date;
+    updatedAt?: Date;
   }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -400,6 +406,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const wakeupRequestId = randomUUID();
     const issueId = randomUUID();
     const now = new Date("2026-03-19T00:00:00.000Z");
+    const startedAt = input && "startedAt" in input ? input.startedAt : now;
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
 
     await db.insert(companies).values({
@@ -448,8 +455,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       processLossRetryCount: input?.processLossRetryCount ?? 0,
       errorCode: input?.runErrorCode ?? null,
       error: input?.runError ?? null,
-      startedAt: now,
-      updatedAt: new Date("2026-03-19T00:00:00.000Z"),
+      startedAt,
+      processStartedAt: input?.processStartedAt ?? null,
+      lastOutputAt: input?.lastOutputAt ?? null,
+      createdAt: input?.createdAt ?? now,
+      updatedAt: input?.updatedAt ?? now,
     });
 
     if (input?.includeIssue !== false) {
@@ -918,6 +928,79 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const failedRun = runs.find((row) => row.id === runId);
     expect(failedRun?.status).toBe("failed");
     expect(failedRun?.errorCode).toBe("process_lost");
+  });
+
+  it("continues pid rechecks after detached activity clears the warning", async () => {
+    const now = new Date();
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "claude_local",
+      processPid: 999_999_999,
+      includeIssue: false,
+      startedAt: now,
+      processStartedAt: now,
+      updatedAt: now,
+    });
+    await db.insert(heartbeatRunEvents).values({
+      companyId,
+      agentId,
+      runId,
+      seq: 1,
+      eventType: "lifecycle",
+      stream: "system",
+      level: "info",
+      message: DETACHED_PROCESS_ACTIVITY_CLEARED_MESSAGE,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns({ staleThresholdMs: 60 * 60 * 1000 });
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("process_lost");
+  });
+
+  it("uses run activity timestamps instead of updatedAt for orphan staleness", async () => {
+    const processStartedAt = new Date(Date.now() - 60 * 60 * 1000);
+    const { runId } = await seedRunFixture({
+      processPid: 999_999_999,
+      includeIssue: false,
+      startedAt: processStartedAt,
+      processStartedAt,
+      updatedAt: new Date(),
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 });
+
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("process_lost");
+  });
+
+  it("uses createdAt instead of updatedAt as the orphan staleness fallback", async () => {
+    const createdAt = new Date(Date.now() - 60 * 60 * 1000);
+    const { runId } = await seedRunFixture({
+      processPid: 999_999_999,
+      includeIssue: false,
+      startedAt: null,
+      processStartedAt: null,
+      lastOutputAt: null,
+      createdAt,
+      updatedAt: new Date(),
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 });
+
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("process_lost");
   });
 
   it("queues exactly one retry when the recorded local pid is dead", async () => {

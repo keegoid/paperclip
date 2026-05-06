@@ -108,6 +108,10 @@ import { executionWorkspaceService, mergeExecutionWorkspaceConfig } from "./exec
 import { workspaceOperationService } from "./workspace-operations.js";
 import { isProcessGroupAlive, terminateLocalService } from "./local-service-supervisor.js";
 import {
+  DETACHED_PROCESS_ACTIVITY_CLEARED_MESSAGE,
+  isTrackedLocalChildProcessAdapter,
+} from "./local-run-events.js";
+import {
   buildExecutionWorkspaceAdapterConfig,
   gateProjectExecutionWorkspacePolicy,
   issueExecutionWorkspaceModeForPersistedWorkspace,
@@ -281,15 +285,6 @@ function mergeAdapterRecoveryMetadata(input: {
   };
 }
 const RUNNING_ISSUE_WAKE_REASONS_REQUIRING_FOLLOWUP = new Set(["approval_approved"]);
-const SESSIONED_LOCAL_ADAPTERS = new Set([
-  "claude_local",
-  "codex_local",
-  "cursor",
-  "gemini_local",
-  "hermes_local",
-  "opencode_local",
-  "pi_local",
-]);
 const INLINE_BASE64_IMAGE_DATA_RE = /("type":"image","source":\{"type":"base64","data":")([A-Za-z0-9+/=]{1024,})(")/g;
 
 type RuntimeConfigSecretResolver = Pick<
@@ -1983,10 +1978,6 @@ function isSameTaskScope(left: string | null, right: string | null) {
   return (left ?? null) === (right ?? null);
 }
 
-function isTrackedLocalChildProcessAdapter(adapterType: string) {
-  return SESSIONED_LOCAL_ADAPTERS.has(adapterType);
-}
-
 function isHeartbeatRunTerminalStatus(
   status: string | null | undefined,
 ): status is (typeof HEARTBEAT_RUN_TERMINAL_STATUSES)[number] {
@@ -2225,7 +2216,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     cancelWorkForScope: cancelBudgetScopeWork,
   };
   const budgets = budgetService(db, budgetHooks);
-  const recovery = recoveryService(db, { enqueueWakeup });
+  const recovery = recoveryService(db, {
+    enqueueWakeup,
+    finalizeDeadDetachedActivityClearedRun,
+  });
   const productivityReviews = productivityReviewService(db, { enqueueWakeup });
   let unsafeTextProjectionPromise: Promise<boolean> | null = null;
 
@@ -3897,6 +3891,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return Number(row?.maxSeq ?? 0) + 1;
   }
 
+  async function isLastRunEvent(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">,
+    expected: { eventType: string; message: string },
+  ) {
+    const [event] = await db
+      .select({
+        eventType: heartbeatRunEvents.eventType,
+        message: heartbeatRunEvents.message,
+      })
+      .from(heartbeatRunEvents)
+      .where(and(eq(heartbeatRunEvents.companyId, run.companyId), eq(heartbeatRunEvents.runId, run.id)))
+      .orderBy(desc(heartbeatRunEvents.seq), desc(heartbeatRunEvents.createdAt))
+      .limit(1);
+
+    return event?.eventType === expected.eventType && event.message === expected.message;
+  }
+
   async function persistRunProcessMetadata(
     runId: string,
     meta: { pid: number; processGroupId: number | null; startedAt: string },
@@ -3932,7 +3943,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       eventType: "lifecycle",
       stream: "system",
       level: "info",
-      message: "Detached child process reported activity; cleared detached warning",
+      message: DETACHED_PROCESS_ACTIVITY_CLEARED_MESSAGE,
     });
     return updated;
   }
@@ -5804,6 +5815,139 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
+  function orphanedRunStalenessReferenceAt(
+    run: Pick<
+      typeof heartbeatRuns.$inferSelect,
+      "lastOutputAt" | "processStartedAt" | "startedAt" | "createdAt"
+    >,
+  ) {
+    return run.lastOutputAt ?? run.processStartedAt ?? run.startedAt ?? run.createdAt ?? null;
+  }
+
+  async function finalizeLostLocalChildRun(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    agent: Pick<typeof agents.$inferSelect, "adapterType" | "adapterConfig">;
+    now: Date;
+    descendantOnlyCleanup?: boolean;
+    startQueuedRuns?: boolean;
+  }) {
+    const currentRun = await getRun(input.run.id, { unsafeFullResultJson: true });
+    if (!currentRun || currentRun.status !== "running") return null;
+
+    const tracksLocalChild = isTrackedLocalChildProcessAdapter(input.agent.adapterType);
+    const shouldRetry =
+      tracksLocalChild &&
+      (!!currentRun.processPid || !!currentRun.processGroupId) &&
+      (currentRun.processLossRetryCount ?? 0) < 1;
+    const baseMessage = buildProcessLossMessage(
+      currentRun,
+      input.descendantOnlyCleanup ? { descendantOnly: true } : undefined,
+    );
+
+    let finalizedRun = await setRunStatus(currentRun.id, "failed", {
+      error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
+      errorCode: "process_lost",
+      finishedAt: input.now,
+      resultJson: mergeRunStopMetadataForAgent(
+        input.agent,
+        "failed",
+        {
+          resultJson: parseObject(currentRun.resultJson),
+          errorCode: "process_lost",
+          errorMessage: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
+        },
+      ),
+    });
+    await setWakeupStatus(currentRun.wakeupRequestId, "failed", {
+      finishedAt: input.now,
+      error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
+    });
+    if (!finalizedRun) finalizedRun = await getRun(currentRun.id, { unsafeFullResultJson: true });
+    if (!finalizedRun) return null;
+    finalizedRun = await classifyAndPersistRunLiveness(finalizedRun, parseObject(finalizedRun.resultJson)) ?? finalizedRun;
+    await releaseEnvironmentLeasesForRun({
+      runId: finalizedRun.id,
+      companyId: finalizedRun.companyId,
+      agentId: finalizedRun.agentId,
+      status: finalizedRun.status,
+      failureReason: finalizedRun.error ?? undefined,
+    });
+
+    let retriedRun: typeof heartbeatRuns.$inferSelect | null = null;
+    if (shouldRetry) {
+      const agent = await getAgent(currentRun.agentId);
+      if (agent) {
+        retriedRun = await enqueueProcessLossRetry(finalizedRun, agent, input.now);
+      }
+    } else {
+      await releaseIssueExecutionAndPromote(finalizedRun, {
+        startQueuedRuns: input.startQueuedRuns,
+      });
+    }
+
+    await appendRunEvent(finalizedRun, await nextRunEventSeq(finalizedRun.id), {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "error",
+      message: shouldRetry
+        ? `${baseMessage}; queued retry ${retriedRun?.id ?? ""}`.trim()
+        : baseMessage,
+      payload: {
+        ...(currentRun.processPid ? { processPid: currentRun.processPid } : {}),
+        ...(currentRun.processGroupId ? { processGroupId: currentRun.processGroupId } : {}),
+        ...(input.descendantOnlyCleanup ? { descendantOnlyCleanup: true } : {}),
+        ...(retriedRun ? { retryRunId: retriedRun.id } : {}),
+      },
+    });
+
+    await finalizeAgentStatus(currentRun.agentId, "failed");
+    if (input.startQueuedRuns ?? true) {
+      await startNextQueuedRunForAgent(currentRun.agentId);
+    }
+    runningProcesses.delete(currentRun.id);
+
+    return { finalizedRun, retriedRun };
+  }
+
+  async function finalizeDeadDetachedActivityClearedRun(
+    run: typeof heartbeatRuns.$inferSelect,
+    opts?: { now?: Date },
+  ) {
+    const currentRun = await getRun(run.id, { unsafeFullResultJson: true });
+    if (!currentRun || currentRun.status !== "running") return null;
+    const agent = await getAgent(currentRun.agentId);
+    if (!agent || !isTrackedLocalChildProcessAdapter(agent.adapterType)) return null;
+    if (!await isLastRunEvent(currentRun, {
+      eventType: "lifecycle",
+      message: DETACHED_PROCESS_ACTIVITY_CLEARED_MESSAGE,
+    })) {
+      return null;
+    }
+    if (currentRun.processPid && isProcessAlive(currentRun.processPid)) return null;
+
+    let descendantOnlyCleanup = false;
+    if (currentRun.processGroupId && isProcessGroupAlive(currentRun.processGroupId)) {
+      descendantOnlyCleanup = true;
+      await terminateHeartbeatRunProcess({
+        pid: currentRun.processPid,
+        processGroupId: currentRun.processGroupId,
+      });
+    }
+
+    const result = await finalizeLostLocalChildRun({
+      run: currentRun,
+      agent,
+      now: opts?.now ?? new Date(),
+      descendantOnlyCleanup,
+      startQueuedRuns: false,
+    });
+    if (!result) return null;
+    return {
+      finalizedRunId: result.finalizedRun.id,
+      retryRunId: result.retriedRun?.id ?? null,
+    };
+  }
+
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
@@ -5825,14 +5969,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
 
       const isDetachedRun = run.errorCode === DETACHED_PROCESS_ERROR_CODE;
+      const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
+      const detachedActivityClearedRun =
+        !isDetachedRun &&
+        tracksLocalChild &&
+        await isLastRunEvent(run, {
+          eventType: "lifecycle",
+          message: DETACHED_PROCESS_ACTIVITY_CLEARED_MESSAGE,
+        });
       // Apply staleness threshold to avoid false positives. Runs already marked
-      // detached have passed that gate and need bounded PID rechecks.
-      if (staleThresholdMs > 0 && !isDetachedRun) {
-        const refTime = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
+      // detached, or runs that just cleared a detached warning via child
+      // activity, have passed that gate and need bounded PID rechecks.
+      if (staleThresholdMs > 0 && !isDetachedRun && !detachedActivityClearedRun) {
+        const refTime = orphanedRunStalenessReferenceAt(run)?.getTime() ?? 0;
         if (now.getTime() - refTime < staleThresholdMs) continue;
       }
 
-      const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
       const processPidAlive = tracksLocalChild && run.processPid && isProcessAlive(run.processPid);
       const processGroupAlive = tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId);
       if (processPidAlive) {
@@ -5866,67 +6018,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       }
 
-      const shouldRetry = tracksLocalChild && (!!run.processPid || !!run.processGroupId) && (run.processLossRetryCount ?? 0) < 1;
-      const baseMessage = buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
-
-      let finalizedRun = await setRunStatus(run.id, "failed", {
-        error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
-        errorCode: "process_lost",
-        finishedAt: now,
-        resultJson: mergeRunStopMetadataForAgent(
-          { adapterType, adapterConfig },
-          "failed",
-          {
-            resultJson: parseObject(run.resultJson),
-            errorCode: "process_lost",
-            errorMessage: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
-          },
-        ),
+      const finalized = await finalizeLostLocalChildRun({
+        run,
+        agent: { adapterType, adapterConfig },
+        now,
+        descendantOnlyCleanup,
       });
-      await setWakeupStatus(run.wakeupRequestId, "failed", {
-        finishedAt: now,
-        error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
-      });
-      if (!finalizedRun) finalizedRun = await getRun(run.id);
-      if (!finalizedRun) continue;
-      finalizedRun = await classifyAndPersistRunLiveness(finalizedRun, parseObject(finalizedRun.resultJson)) ?? finalizedRun;
-      await releaseEnvironmentLeasesForRun({
-        runId: finalizedRun.id,
-        companyId: finalizedRun.companyId,
-        agentId: finalizedRun.agentId,
-        status: finalizedRun.status,
-        failureReason: finalizedRun.error ?? undefined,
-      });
-
-      let retriedRun: typeof heartbeatRuns.$inferSelect | null = null;
-      if (shouldRetry) {
-        const agent = await getAgent(run.agentId);
-        if (agent) {
-          retriedRun = await enqueueProcessLossRetry(finalizedRun, agent, now);
-        }
-      } else {
-        await releaseIssueExecutionAndPromote(finalizedRun);
-      }
-
-      await appendRunEvent(finalizedRun, await nextRunEventSeq(finalizedRun.id), {
-        eventType: "lifecycle",
-        stream: "system",
-        level: "error",
-        message: shouldRetry
-          ? `${baseMessage}; queued retry ${retriedRun?.id ?? ""}`.trim()
-          : baseMessage,
-        payload: {
-          ...(run.processPid ? { processPid: run.processPid } : {}),
-          ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
-          ...(descendantOnlyCleanup ? { descendantOnlyCleanup: true } : {}),
-          ...(retriedRun ? { retryRunId: retriedRun.id } : {}),
-        },
-      });
-
-      await finalizeAgentStatus(run.agentId, "failed");
-      await startNextQueuedRunForAgent(run.agentId);
-      runningProcesses.delete(run.id);
-      reaped.push(run.id);
+      if (finalized) reaped.push(run.id);
     }
 
     if (reaped.length > 0) {
@@ -7447,7 +7545,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     );
   }
 
-  async function releaseIssueExecutionAndPromote(run: typeof heartbeatRuns.$inferSelect) {
+  async function releaseIssueExecutionAndPromote(
+    run: typeof heartbeatRuns.$inferSelect,
+    opts?: { startQueuedRuns?: boolean },
+  ) {
     const runContext = parseObject(run.contextSnapshot);
     const contextIssueId = readNonEmptyString(runContext.issueId);
     const taskKey = deriveTaskKeyWithHeartbeatFallback(runContext, null);
@@ -7854,7 +7955,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       },
     });
 
-    await startNextQueuedRunForAgent(promotedRun.agentId);
+    if (opts?.startQueuedRuns ?? true) {
+      await startNextQueuedRunForAgent(promotedRun.agentId);
+    }
   }
 
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}) {

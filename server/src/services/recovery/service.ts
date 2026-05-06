@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, inArray, isNull, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -31,6 +31,10 @@ import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
 import { issueService } from "../issues.js";
+import {
+  DETACHED_PROCESS_ACTIVITY_CLEARED_MESSAGE,
+  isTrackedLocalChildProcessAdapter,
+} from "../local-run-events.js";
 import { getRunLogStore } from "../run-log-store.js";
 import {
   RECOVERY_ORIGIN_KINDS,
@@ -70,6 +74,10 @@ type RecoveryWakeup = (
   agentId: string,
   opts?: RecoveryWakeupOptions,
 ) => Promise<typeof heartbeatRuns.$inferSelect | null>;
+type RecoveryDeadDetachedActivityClearedRun = (
+  run: typeof heartbeatRuns.$inferSelect,
+  opts?: { now?: Date },
+) => Promise<{ finalizedRunId: string; retryRunId?: string | null } | null>;
 
 type LatestIssueRun = Pick<
   typeof heartbeatRuns.$inferSelect,
@@ -137,6 +145,19 @@ export function resolveRunOutputSilenceThresholds(runtimeConfig: unknown): RunOu
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function isProcessAlive(pid: number | null | undefined) {
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    if (code === "EPERM") return true;
+    if (code === "ESRCH") return false;
+    return false;
+  }
 }
 
 function summarizeRunFailureForIssueComment(run: LatestIssueRun) {
@@ -334,7 +355,13 @@ function buildLivenessOriginalIssueComment(finding: IssueLivenessFinding, escala
   ].join("\n");
 }
 
-export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup }) {
+export function recoveryService(
+  db: Db,
+  deps: {
+    enqueueWakeup: RecoveryWakeup;
+    finalizeDeadDetachedActivityClearedRun?: RecoveryDeadDetachedActivityClearedRun;
+  },
+) {
   const issuesSvc = issueService(db);
   const treeControlSvc = issueTreeControlService(db);
   const budgets = budgetService(db);
@@ -653,6 +680,39 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return row ?? null;
   }
 
+  async function latestActiveOutputDismissalDecision(run: typeof heartbeatRuns.$inferSelect) {
+    const silenceStartedAt = silenceStartedAtForRun(run);
+
+    const [row] = await db
+      .select()
+      .from(heartbeatRunWatchdogDecisions)
+      .where(
+        and(
+          eq(heartbeatRunWatchdogDecisions.companyId, run.companyId),
+          eq(heartbeatRunWatchdogDecisions.runId, run.id),
+          eq(heartbeatRunWatchdogDecisions.decision, "dismissed_false_positive"),
+          // Normal rows are interval-scoped by run activity/start timestamps.
+          // If an old/corrupt row has no anchor, keep the explicit run-level
+          // dismissal dedup instead of minting repeat evaluations.
+          silenceStartedAt ? gte(heartbeatRunWatchdogDecisions.createdAt, silenceStartedAt) : undefined,
+        ),
+      )
+      .orderBy(desc(heartbeatRunWatchdogDecisions.createdAt))
+      .limit(1);
+    return row ?? null;
+  }
+
+  async function latestActiveOutputSuppressionDecision(run: typeof heartbeatRuns.$inferSelect, now = new Date()) {
+    const [quietUntilDecision, dismissalDecision] = await Promise.all([
+      latestActiveOutputQuietUntilDecision(run.companyId, run.id, now),
+      latestActiveOutputDismissalDecision(run),
+    ]);
+
+    if (!quietUntilDecision) return dismissalDecision;
+    if (!dismissalDecision) return quietUntilDecision;
+    return quietUntilDecision.createdAt >= dismissalDecision.createdAt ? quietUntilDecision : dismissalDecision;
+  }
+
   async function findOpenStaleRunEvaluation(companyId: string, runId: string) {
     const [row] = await db
       .select({
@@ -675,6 +735,31 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       )
       .limit(1);
     return row ?? null;
+  }
+
+  async function isDeadDetachedActivityClearedRun(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    runningAgent: typeof agents.$inferSelect;
+  }) {
+    if (!isTrackedLocalChildProcessAdapter(input.runningAgent.adapterType)) return false;
+    if (runningProcesses.has(input.run.id)) return false;
+    if (!input.run.processPid) return false;
+
+    const [event] = await db
+      .select({
+        eventType: heartbeatRunEvents.eventType,
+        message: heartbeatRunEvents.message,
+      })
+      .from(heartbeatRunEvents)
+      .where(and(eq(heartbeatRunEvents.companyId, input.run.companyId), eq(heartbeatRunEvents.runId, input.run.id)))
+      .orderBy(desc(heartbeatRunEvents.seq), desc(heartbeatRunEvents.createdAt))
+      .limit(1);
+
+    if (event?.eventType !== "lifecycle" || event.message !== DETACHED_PROCESS_ACTIVITY_CLEARED_MESSAGE) {
+      return false;
+    }
+
+    return !isProcessAlive(input.run.processPid);
   }
 
   async function buildRunOutputSilence(
@@ -1009,6 +1094,27 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }) {
     const runningAgent = await getAgent(input.run.agentId);
     if (!runningAgent || runningAgent.companyId !== input.run.companyId) return { kind: "skipped" as const };
+    if (await isDeadDetachedActivityClearedRun({ run: input.run, runningAgent })) {
+      const finalization = await deps.finalizeDeadDetachedActivityClearedRun?.(input.run, { now: input.now });
+      await logActivity(db, {
+        companyId: input.run.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: input.run.agentId,
+        runId: input.run.id,
+        action: "heartbeat.output_stale_dead_detached_skip",
+        entityType: "heartbeat_run",
+        entityId: input.run.id,
+        details: {
+          source: "recovery.scan_silent_active_runs",
+          processPid: input.run.processPid,
+          lastEvent: DETACHED_PROCESS_ACTIVITY_CLEARED_MESSAGE,
+          finalizedRunId: finalization?.finalizedRunId ?? null,
+          retryRunId: finalization?.retryRunId ?? null,
+        },
+      });
+      return { kind: "skipped" as const };
+    }
     const sourceIssue = await resolveStaleRunSourceIssue(input.run);
     if (await shouldSuppressRecursiveStaleRunEvaluation({ run: input.run, sourceIssue })) {
       await logActivity(db, {
@@ -1182,8 +1288,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     };
 
     for (const run of candidates) {
-      if (await latestActiveOutputQuietUntilDecision(run.companyId, run.id, now)) {
-        result.snoozed += 1;
+      const suppressionDecision = await latestActiveOutputSuppressionDecision(run, now);
+      if (suppressionDecision) {
+        if (suppressionDecision.decision === "dismissed_false_positive") result.skipped += 1;
+        else result.snoozed += 1;
         continue;
       }
       const outcome = await createOrUpdateStaleRunEvaluation({ run, now });
@@ -1306,6 +1414,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         createdByAgentId: input.actor.type === "agent" ? input.actor.agentId ?? null : null,
         createdByUserId: input.actor.type === "board" ? input.actor.userId ?? null : null,
         createdByRunId,
+        createdAt: decisionNow,
       })
       .returning();
 
