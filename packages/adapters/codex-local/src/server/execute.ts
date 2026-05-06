@@ -79,6 +79,23 @@ function hasNonEmptyEnvValue(env: Record<string, string>, key: string): boolean 
   return typeof raw === "string" && raw.trim().length > 0;
 }
 
+function hasNonEmptyContextValue(context: Record<string, unknown>, key: string): boolean {
+  const value = context[key];
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function shouldEmitTimerNoWorkEvent(context: Record<string, unknown>): boolean {
+  if (asString(context.wakeSource, "") !== "timer") return false;
+  return ![
+    "issueId",
+    "taskId",
+    "taskKey",
+    "commentId",
+    "wakeCommentId",
+    "approvalId",
+  ].some((key) => hasNonEmptyContextValue(context, key));
+}
+
 function resolveCodexBillingType(env: Record<string, string>): "api" | "subscription" {
   // Codex uses API-key auth when OPENAI_API_KEY is present; otherwise rely on local login/session auth.
   return hasNonEmptyEnvValue(env, "OPENAI_API_KEY") ? "api" : "subscription";
@@ -652,6 +669,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     heartbeatPromptChars: renderedPrompt.length,
   };
 
+  let timerNoWorkEventEmitted = false;
+  const emitTimerNoWorkEvent = async () => {
+    if (timerNoWorkEventEmitted || !shouldEmitTimerNoWorkEvent(context)) return;
+    timerNoWorkEventEmitted = true;
+    await onLog(
+      "stdout",
+      `${JSON.stringify({
+        event: "no_work",
+        reason: "timer_no_scoped_work",
+        adapter: "codex_local",
+        runId,
+      })}\n`,
+    );
+  };
+
   const runAttempt = async (resumeSessionId: string | null) => {
     const execArgs = buildCodexExecArgs(
       forceSaferInvocation ? { ...config, fastMode: false } : config,
@@ -678,6 +710,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         context,
       });
     }
+    await emitTimerNoWorkEvent();
 
     const proc = await runAdapterExecutionTargetProcess(runId, executionTarget, command, args, {
       cwd,
