@@ -106,6 +106,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     logChunk?: string;
     agentRuntimeConfig?: Record<string, unknown>;
     processPid?: number | null;
+    processGroupId?: number | null;
     processLossRetryCount?: number;
     adapterType?: string;
     issueStatus?: string;
@@ -177,6 +178,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       lastOutputSeq: opts.withOutput ? 3 : 0,
       lastOutputStream: opts.withOutput ? "stdout" : null,
       processPid: opts.processPid ?? null,
+      processGroupId: opts.processGroupId ?? null,
       processLossRetryCount: opts.processLossRetryCount ?? 0,
       contextSnapshot: sourceIssueInContext ? { issueId } : {},
       stdoutExcerpt: "OPENAI_API_KEY=sk-test-secret-value should not leak",
@@ -324,15 +326,127 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     expect(run?.finishedAt?.toISOString()).toBe(now.toISOString());
 
     const [event] = await db
-      .select({ eventType: heartbeatRunEvents.eventType, message: heartbeatRunEvents.message })
+      .select({
+        eventType: heartbeatRunEvents.eventType,
+        level: heartbeatRunEvents.level,
+        message: heartbeatRunEvents.message,
+      })
       .from(heartbeatRunEvents)
       .where(and(eq(heartbeatRunEvents.companyId, companyId), eq(heartbeatRunEvents.runId, runId)))
       .orderBy(sql`${heartbeatRunEvents.seq} desc`)
       .limit(1);
     expect(event).toEqual({
       eventType: "lifecycle",
+      level: "warn",
       message: "stale_terminated",
     });
+  });
+
+  it("auto-terminates when the recorded process group is gone even if the pid was recycled", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, runId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
+      processPid: process.pid,
+      processGroupId: 999_999_999,
+      sourceIssueInContext: false,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.scanSilentActiveRuns({ now, companyId });
+
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(1);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("cancelled");
+    expect(run?.errorCode).toBe("stale_terminated");
+  });
+
+  it("does not treat an unreadable run-log tail as empty auto-termination evidence", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, runId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
+      processPid: 999_999_999,
+      sourceIssueInContext: false,
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({
+        logStore: "local_file",
+        logRef: "missing-watchdog-tail.log",
+        logBytes: 1024,
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.scanSilentActiveRuns({ now, companyId });
+
+    expect(result.created).toBe(1);
+    expect(result.skipped).toBe(0);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("running");
+
+    const [evaluation] = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
+    expect(evaluation?.description).toContain("Run-log tail could not be read");
+  });
+
+  it("auto-terminates a critical silent run whose source issue is terminal", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, issueId, runId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
+      processPid: 999_999_999,
+      issueStatus: "done",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.scanSilentActiveRuns({ now, companyId });
+
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(1);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("cancelled");
+    expect(run?.errorCode).toBe("stale_terminated");
+
+    const [source] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(source?.executionRunId).not.toBe(runId);
+  });
+
+  it("does not start queued sibling runs during stale auto-termination cleanup", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, coderId, runId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
+      processPid: 999_999_999,
+      sourceIssueInContext: false,
+    });
+    const queuedRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: queuedRunId,
+      companyId,
+      agentId: coderId,
+      status: "queued",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      contextSnapshot: {},
+      createdAt: now,
+      updatedAt: now,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.scanSilentActiveRuns({ now, companyId });
+
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(1);
+    const [staleRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    const [queuedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, queuedRunId));
+    expect(staleRun?.status).toBe("cancelled");
+    expect(queuedRun?.status).toBe("queued");
+    expect(queuedRun?.startedAt).toBeNull();
   });
 
   it("redacts sensitive values from actual run-log evidence", async () => {

@@ -33,8 +33,10 @@ import { issueTreeControlService } from "../issue-tree-control.js";
 import { issueService } from "../issues.js";
 import {
   DETACHED_PROCESS_ACTIVITY_CLEARED_MESSAGE,
+  isRecordedLocalChildProcessAlive,
   isTrackedLocalChildProcessAdapter,
 } from "../local-run-events.js";
+import { isProcessGroupAlive } from "../local-service-supervisor.js";
 import { getRunLogStore } from "../run-log-store.js";
 import {
   RECOVERY_ORIGIN_KINDS,
@@ -820,17 +822,17 @@ export function recoveryService(
   }
 
   async function readRunLogTailForEvidence(run: typeof heartbeatRuns.$inferSelect) {
-    if (!run.logStore || !run.logRef || !run.logBytes) return "";
+    if (!run.logStore || !run.logRef || !run.logBytes) return { content: "", readFailed: false };
     try {
       const offset = Math.max(0, run.logBytes - ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES);
       const result = await runLogStore.read(
         { store: run.logStore as "local_file", logRef: run.logRef },
         { offset, limitBytes: ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES },
       );
-      return result.content;
+      return { content: result.content, readFailed: false };
     } catch (err) {
       logger.warn({ err, runId: run.id }, "failed to read stale-run watchdog evidence tail");
-      return "";
+      return { content: "", readFailed: true };
     }
   }
 
@@ -886,7 +888,7 @@ export function recoveryService(
     prefix: string;
     now: Date;
   }) {
-    const [tail, recentEvents, childIssues, blockers] = await Promise.all([
+    const [tailEvidence, recentEvents, childIssues, blockers] = await Promise.all([
       readRunLogTailForEvidence(input.run),
       db
         .select({
@@ -923,11 +925,12 @@ export function recoveryService(
         : Promise.resolve([]),
     ]);
     const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
-    const safeTail = truncateEvidenceText(redactWatchdogEvidenceText(tail, currentUserRedactionOptions));
+    const safeTail = truncateEvidenceText(redactWatchdogEvidenceText(tailEvidence.content, currentUserRedactionOptions));
     const silenceAgeMs = silenceAgeMsForRun(input.run, input.now);
     return {
       safeTail,
-      tailEmpty: tail.trim().length === 0,
+      tailEmpty: !tailEvidence.readFailed && tailEvidence.content.trim().length === 0,
+      tailReadFailed: tailEvidence.readFailed,
       silenceAgeMs,
       recentEvents: recentEvents.reverse().map((event) => ({
         eventType: event.eventType,
@@ -987,7 +990,9 @@ export function recoveryService(
       "",
       "## Last Output Excerpt",
       "",
-      input.evidence.safeTail ? `\`\`\`text\n${input.evidence.safeTail}\n\`\`\`` : "_No run-log tail was available._",
+      input.evidence.tailReadFailed
+        ? "_Run-log tail could not be read; preserving the run for manual evaluation._"
+        : input.evidence.safeTail ? `\`\`\`text\n${input.evidence.safeTail}\n\`\`\`` : "_No run-log tail was available._",
       "",
       "## Recent Run Events",
       "",
@@ -1108,7 +1113,14 @@ export function recoveryService(
     if (input.level !== "critical") return false;
     if (!isTrackedLocalChildProcessAdapter(input.runningAgent.adapterType)) return false;
     if (runningProcesses.has(input.run.id)) return false;
-    if (input.run.processPid && isProcessAlive(input.run.processPid)) return false;
+    if (isRecordedLocalChildProcessAlive({
+      processPid: input.run.processPid,
+      processGroupId: input.run.processGroupId,
+      isProcessAlive,
+      isProcessGroupAlive,
+    })) {
+      return false;
+    }
     if (!input.evidence.tailEmpty) return false;
     if (input.sourceIssue && !isTerminalIssueStatus(input.sourceIssue.status)) return false;
     if (input.evidence.childIssues.some((issue) => !isTerminalIssueStatus(issue.status))) return false;
