@@ -5829,6 +5829,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agent: Pick<typeof agents.$inferSelect, "adapterType" | "adapterConfig">;
     now: Date;
     descendantOnlyCleanup?: boolean;
+    startQueuedRuns?: boolean;
   }) {
     const currentRun = await getRun(input.run.id, { unsafeFullResultJson: true });
     if (!currentRun || currentRun.status !== "running") return null;
@@ -5879,7 +5880,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         retriedRun = await enqueueProcessLossRetry(finalizedRun, agent, input.now);
       }
     } else {
-      await releaseIssueExecutionAndPromote(finalizedRun);
+      await releaseIssueExecutionAndPromote(finalizedRun, {
+        startQueuedRuns: input.startQueuedRuns,
+      });
     }
 
     await appendRunEvent(finalizedRun, await nextRunEventSeq(finalizedRun.id), {
@@ -5898,7 +5901,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
 
     await finalizeAgentStatus(currentRun.agentId, "failed");
-    await startNextQueuedRunForAgent(currentRun.agentId);
+    if (input.startQueuedRuns ?? true) {
+      await startNextQueuedRunForAgent(currentRun.agentId);
+    }
     runningProcesses.delete(currentRun.id);
 
     return { finalizedRun, retriedRun };
@@ -5931,6 +5936,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       agent,
       now: new Date(),
       descendantOnlyCleanup,
+      startQueuedRuns: false,
     });
     if (!result) return null;
     return {
@@ -7536,7 +7542,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     );
   }
 
-  async function releaseIssueExecutionAndPromote(run: typeof heartbeatRuns.$inferSelect) {
+  async function releaseIssueExecutionAndPromote(
+    run: typeof heartbeatRuns.$inferSelect,
+    opts?: { startQueuedRuns?: boolean },
+  ) {
     const runContext = parseObject(run.contextSnapshot);
     const contextIssueId = readNonEmptyString(runContext.issueId);
     const taskKey = deriveTaskKeyWithHeartbeatFallback(runContext, null);
@@ -7943,7 +7952,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       },
     });
 
-    await startNextQueuedRunForAgent(promotedRun.agentId);
+    if (opts?.startQueuedRuns ?? true) {
+      await startNextQueuedRunForAgent(promotedRun.agentId);
+    }
   }
 
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}) {
