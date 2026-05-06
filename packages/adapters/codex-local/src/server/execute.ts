@@ -86,6 +86,8 @@ function hasNonEmptyContextValue(context: Record<string, unknown>, key: string):
 
 function shouldEmitTimerNoWorkEvent(context: Record<string, unknown>): boolean {
   if (asString(context.wakeSource, "") !== "timer") return false;
+  // Retry runs can preserve the original timer wakeSource while running under an automation reason.
+  if (asString(context.wakeReason, "") !== "heartbeat_timer") return false;
   return ![
     "issueId",
     "taskId",
@@ -93,6 +95,8 @@ function shouldEmitTimerNoWorkEvent(context: Record<string, unknown>): boolean {
     "commentId",
     "wakeCommentId",
     "approvalId",
+    "retryOfRunId",
+    "retryReason",
   ].some((key) => hasNonEmptyContextValue(context, key));
 }
 
