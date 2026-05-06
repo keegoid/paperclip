@@ -5824,8 +5824,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     for (const { run, adapterType, adapterConfig } of activeRuns) {
       if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
 
-      // Apply staleness threshold to avoid false positives
-      if (staleThresholdMs > 0) {
+      const isDetachedRun = run.errorCode === DETACHED_PROCESS_ERROR_CODE;
+      // Apply staleness threshold to avoid false positives. Runs already marked
+      // detached have passed that gate and need bounded PID rechecks.
+      if (staleThresholdMs > 0 && !isDetachedRun) {
         const refTime = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
         if (now.getTime() - refTime < staleThresholdMs) continue;
       }
@@ -5834,7 +5836,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const processPidAlive = tracksLocalChild && run.processPid && isProcessAlive(run.processPid);
       const processGroupAlive = tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId);
       if (processPidAlive) {
-        if (run.errorCode !== DETACHED_PROCESS_ERROR_CODE) {
+        if (!isDetachedRun) {
           const detachedMessage = `Lost in-memory process handle, but child pid ${run.processPid} is still alive`;
           const detachedRun = await setRunStatus(run.id, "running", {
             error: detachedMessage,

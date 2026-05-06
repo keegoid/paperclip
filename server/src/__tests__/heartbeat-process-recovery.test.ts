@@ -885,6 +885,41 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(wakeup?.status).toBe("claimed");
   });
 
+  it("rechecks a detached local run even inside the normal staleness window", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    expect(child.pid).toBeTypeOf("number");
+    const childPid = child.pid;
+    if (typeof childPid !== "number") throw new Error("Expected spawned child pid");
+
+    const { agentId, runId } = await seedRunFixture({
+      processPid: childPid,
+      includeIssue: false,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const first = await heartbeat.reapOrphanedRuns();
+    expect(first.reaped).toBe(0);
+    const detachedRun = await heartbeat.getRun(runId);
+    expect(detachedRun?.status).toBe("running");
+    expect(detachedRun?.errorCode).toBe("process_detached");
+
+    child.kill("SIGKILL");
+    expect(await waitForPidExit(childPid, 2_000)).toBe(true);
+
+    const second = await heartbeat.reapOrphanedRuns({ staleThresholdMs: 60 * 60 * 1000 });
+    expect(second.reaped).toBe(1);
+    expect(second.runIds).toEqual([runId]);
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const failedRun = runs.find((row) => row.id === runId);
+    expect(failedRun?.status).toBe("failed");
+    expect(failedRun?.errorCode).toBe("process_lost");
+  });
+
   it("queues exactly one retry when the recorded local pid is dead", async () => {
     const { agentId, runId, issueId } = await seedRunFixture({
       processPid: 999_999_999,
