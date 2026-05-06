@@ -99,6 +99,19 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     await tempDb?.cleanup();
   });
 
+  async function waitForNoActiveRuns(companyId: string, timeoutMs = 5_000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const activeRuns = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.companyId, companyId), sql`${heartbeatRuns.status} in ('queued', 'running')`));
+      if (activeRuns.length === 0) return;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    throw new Error(`Timed out waiting for active runs to finish for company ${companyId}`);
+  }
+
   async function seedRunningRun(opts: {
     now: Date;
     ageMs: number;
@@ -274,17 +287,26 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       expect(sourceIssue?.executionRunId).not.toBe(runId);
       expect(sourceIssue?.executionLockedAt).not.toEqual(now);
 
-      const [recoveryRun] = await db
+      let [recoveryRun] = await db
         .select()
         .from(heartbeatRuns)
         .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.retryOfRunId, runId)));
-      expect(recoveryRun?.status).toBe("queued");
+      expect(["queued", "running"]).toContain(recoveryRun?.status);
+      expect(recoveryRun?.contextSnapshot as Record<string, unknown> | undefined).toMatchObject({
+        retryReason: "assignment_recovery",
+        retryOfRunId: runId,
+      });
       expect(sourceIssue?.executionRunId).toBe(recoveryRun?.id ?? null);
 
-      await db
-        .update(heartbeatRuns)
-        .set({ status: "cancelled" })
-        .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.status, "queued")));
+      await waitForNoActiveRuns(companyId);
+      [recoveryRun] = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, recoveryRun?.id ?? "")));
+      expect(["succeeded", "failed", "cancelled", "timed_out"]).toContain(recoveryRun?.status);
+
+      const [sourceAfterRecovery] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(sourceAfterRecovery?.executionRunId).not.toBe(runId);
     },
   );
 
