@@ -393,9 +393,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     includeIssue?: boolean;
     runErrorCode?: string | null;
     runError?: string | null;
-    startedAt?: Date;
+    startedAt?: Date | null;
     processStartedAt?: Date | null;
     lastOutputAt?: Date | null;
+    createdAt?: Date;
     updatedAt?: Date;
   }) {
     const companyId = randomUUID();
@@ -404,7 +405,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const wakeupRequestId = randomUUID();
     const issueId = randomUUID();
     const now = new Date("2026-03-19T00:00:00.000Z");
-    const startedAt = input?.startedAt ?? now;
+    const startedAt = input && "startedAt" in input ? input.startedAt : now;
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
 
     await db.insert(companies).values({
@@ -456,6 +457,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       startedAt,
       processStartedAt: input?.processStartedAt ?? null,
       lastOutputAt: input?.lastOutputAt ?? null,
+      createdAt: input?.createdAt ?? now,
       updatedAt: input?.updatedAt ?? now,
     });
 
@@ -934,6 +936,28 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       includeIssue: false,
       startedAt: processStartedAt,
       processStartedAt,
+      updatedAt: new Date(),
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 });
+
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("process_lost");
+  });
+
+  it("uses createdAt instead of updatedAt as the orphan staleness fallback", async () => {
+    const createdAt = new Date(Date.now() - 60 * 60 * 1000);
+    const { runId } = await seedRunFixture({
+      processPid: 999_999_999,
+      includeIssue: false,
+      startedAt: null,
+      processStartedAt: null,
+      lastOutputAt: null,
+      createdAt,
       updatedAt: new Date(),
     });
     const heartbeat = heartbeatService(db);

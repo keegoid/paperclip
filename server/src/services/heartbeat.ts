@@ -290,6 +290,8 @@ const SESSIONED_LOCAL_ADAPTERS = new Set([
   "opencode_local",
   "pi_local",
 ]);
+const DETACHED_PROCESS_ACTIVITY_CLEARED_MESSAGE =
+  "Detached child process reported activity; cleared detached warning";
 const INLINE_BASE64_IMAGE_DATA_RE = /("type":"image","source":\{"type":"base64","data":")([A-Za-z0-9+/=]{1024,})(")/g;
 
 type RuntimeConfigSecretResolver = Pick<
@@ -3897,6 +3899,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return Number(row?.maxSeq ?? 0) + 1;
   }
 
+  async function isLastRunEvent(
+    runId: string,
+    expected: { eventType: string; message: string },
+  ) {
+    const [event] = await db
+      .select({
+        eventType: heartbeatRunEvents.eventType,
+        message: heartbeatRunEvents.message,
+      })
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, runId))
+      .orderBy(desc(heartbeatRunEvents.seq), desc(heartbeatRunEvents.createdAt))
+      .limit(1);
+
+    return event?.eventType === expected.eventType && event.message === expected.message;
+  }
+
   async function persistRunProcessMetadata(
     runId: string,
     meta: { pid: number; processGroupId: number | null; startedAt: string },
@@ -3932,7 +3951,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       eventType: "lifecycle",
       stream: "system",
       level: "info",
-      message: "Detached child process reported activity; cleared detached warning",
+      message: DETACHED_PROCESS_ACTIVITY_CLEARED_MESSAGE,
     });
     return updated;
   }
@@ -5807,10 +5826,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   function orphanedRunStalenessReferenceAt(
     run: Pick<
       typeof heartbeatRuns.$inferSelect,
-      "lastOutputAt" | "processStartedAt" | "startedAt" | "createdAt" | "updatedAt"
+      "lastOutputAt" | "processStartedAt" | "startedAt" | "createdAt"
     >,
   ) {
-    return run.lastOutputAt ?? run.processStartedAt ?? run.startedAt ?? run.createdAt ?? run.updatedAt ?? null;
+    return run.lastOutputAt ?? run.processStartedAt ?? run.startedAt ?? run.createdAt ?? null;
   }
 
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
@@ -5834,14 +5853,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
 
       const isDetachedRun = run.errorCode === DETACHED_PROCESS_ERROR_CODE;
+      const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
+      const detachedActivityClearedRun =
+        !isDetachedRun &&
+        tracksLocalChild &&
+        await isLastRunEvent(run.id, {
+          eventType: "lifecycle",
+          message: DETACHED_PROCESS_ACTIVITY_CLEARED_MESSAGE,
+        });
       // Apply staleness threshold to avoid false positives. Runs already marked
-      // detached have passed that gate and need bounded PID rechecks.
-      if (staleThresholdMs > 0 && !isDetachedRun) {
+      // detached, or runs that just cleared a detached warning via child
+      // activity, have passed that gate and need bounded PID rechecks.
+      if (staleThresholdMs > 0 && !isDetachedRun && !detachedActivityClearedRun) {
         const refTime = orphanedRunStalenessReferenceAt(run)?.getTime() ?? 0;
         if (now.getTime() - refTime < staleThresholdMs) continue;
       }
 
-      const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
       const processPidAlive = tracksLocalChild && run.processPid && isProcessAlive(run.processPid);
       const processGroupAlive = tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId);
       if (processPidAlive) {

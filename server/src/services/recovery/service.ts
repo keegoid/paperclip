@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, gte, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -54,6 +54,8 @@ const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
 const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.strandedIssueRecovery;
 const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiveRunEvaluation;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
+const DETACHED_PROCESS_ACTIVITY_CLEARED_MESSAGE =
+  "Detached child process reported activity; cleared detached warning";
 
 type RecoveryWakeupOptions = {
   source?: "timer" | "assignment" | "on_demand" | "automation";
@@ -137,6 +139,19 @@ export function resolveRunOutputSilenceThresholds(runtimeConfig: unknown): RunOu
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function isProcessAlive(pid: number | null | undefined) {
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    if (code === "EPERM") return true;
+    if (code === "ESRCH") return false;
+    return false;
+  }
 }
 
 function summarizeRunFailureForIssueComment(run: LatestIssueRun) {
@@ -653,8 +668,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return row ?? null;
   }
 
-  async function latestActiveOutputSuppressionDecision(run: typeof heartbeatRuns.$inferSelect, now = new Date()) {
+  async function latestActiveOutputDismissalDecision(run: typeof heartbeatRuns.$inferSelect) {
     const silenceStartedAt = silenceStartedAtForRun(run);
+    if (!silenceStartedAt) return null;
+
     const [row] = await db
       .select()
       .from(heartbeatRunWatchdogDecisions)
@@ -662,21 +679,24 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         and(
           eq(heartbeatRunWatchdogDecisions.companyId, run.companyId),
           eq(heartbeatRunWatchdogDecisions.runId, run.id),
-          or(
-            and(
-              inArray(heartbeatRunWatchdogDecisions.decision, ["snooze", "continue"]),
-              gt(heartbeatRunWatchdogDecisions.snoozedUntil, now),
-            ),
-            and(
-              eq(heartbeatRunWatchdogDecisions.decision, "dismissed_false_positive"),
-              silenceStartedAt ? gte(heartbeatRunWatchdogDecisions.createdAt, silenceStartedAt) : undefined,
-            ),
-          ),
+          eq(heartbeatRunWatchdogDecisions.decision, "dismissed_false_positive"),
+          gte(heartbeatRunWatchdogDecisions.createdAt, silenceStartedAt),
         ),
       )
       .orderBy(desc(heartbeatRunWatchdogDecisions.createdAt))
       .limit(1);
     return row ?? null;
+  }
+
+  async function latestActiveOutputSuppressionDecision(run: typeof heartbeatRuns.$inferSelect, now = new Date()) {
+    const [quietUntilDecision, dismissalDecision] = await Promise.all([
+      latestActiveOutputQuietUntilDecision(run.companyId, run.id, now),
+      latestActiveOutputDismissalDecision(run),
+    ]);
+
+    if (!quietUntilDecision) return dismissalDecision;
+    if (!dismissalDecision) return quietUntilDecision;
+    return quietUntilDecision.createdAt >= dismissalDecision.createdAt ? quietUntilDecision : dismissalDecision;
   }
 
   async function findOpenStaleRunEvaluation(companyId: string, runId: string) {
@@ -701,6 +721,31 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       )
       .limit(1);
     return row ?? null;
+  }
+
+  async function isDeadDetachedActivityClearedRun(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    runningAgent: typeof agents.$inferSelect;
+  }) {
+    if (input.runningAgent.adapterType !== "claude_local") return false;
+    if (runningProcesses.has(input.run.id)) return false;
+    if (!input.run.processPid) return false;
+
+    const [event] = await db
+      .select({
+        eventType: heartbeatRunEvents.eventType,
+        message: heartbeatRunEvents.message,
+      })
+      .from(heartbeatRunEvents)
+      .where(and(eq(heartbeatRunEvents.companyId, input.run.companyId), eq(heartbeatRunEvents.runId, input.run.id)))
+      .orderBy(desc(heartbeatRunEvents.seq), desc(heartbeatRunEvents.createdAt))
+      .limit(1);
+
+    if (event?.eventType !== "lifecycle" || event.message !== DETACHED_PROCESS_ACTIVITY_CLEARED_MESSAGE) {
+      return false;
+    }
+
+    return !isProcessAlive(input.run.processPid);
   }
 
   async function buildRunOutputSilence(
