@@ -1,5 +1,6 @@
 import type { Db } from "@paperclipai/db";
 import {
+  agentWakeupRequests,
   agentTaskSessions as agentTaskSessionsTable,
   agents as agentsTable,
   budgetIncidents,
@@ -453,6 +454,13 @@ if (_logFlushInterval.unref) _logFlushInterval.unref();
  */
 /** Maximum time (ms) to keep a session event subscription alive before forcing cleanup. */
 const SESSION_EVENT_SUBSCRIPTION_TIMEOUT_MS = 30 * 60 * 1_000; // 30 minutes
+const IDEMPOTENT_PLUGIN_WAKEUP_STATUSES = [
+  "queued",
+  "claimed",
+  "completed",
+  "coalesced",
+  "deferred_issue_execution",
+];
 
 export function buildHostServices(
   db: Db,
@@ -590,6 +598,30 @@ export function buildHostServices(
       entityId: input.entityId,
       details: pluginActivityDetails(input.details, input.actor),
     });
+  };
+
+  const findExistingPluginWakeup = async (
+    companyId: string,
+    agentId: string,
+    idempotencyKey?: string | null,
+  ) => {
+    if (!idempotencyKey) return null;
+    return await db
+      .select({
+        id: agentWakeupRequests.id,
+        runId: agentWakeupRequests.runId,
+        status: agentWakeupRequests.status,
+      })
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.agentId, agentId),
+        eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+        inArray(agentWakeupRequests.status, IDEMPOTENT_PLUGIN_WAKEUP_STATUSES),
+      ))
+      .orderBy(desc(agentWakeupRequests.requestedAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
   };
 
   const collectIssueSubtreeIds = async (companyId: string, rootIssueId: string) => {
@@ -1294,6 +1326,35 @@ export function buildHostServices(
           throw new Error(budgetBlock.reason);
         }
         const contextSource = params.contextSource ?? "plugin.issue.requestWakeup";
+        const existingWakeup = await findExistingPluginWakeup(
+          companyId,
+          issue.assigneeAgentId,
+          params.idempotencyKey,
+        );
+        if (existingWakeup) {
+          await logPluginActivity({
+            companyId,
+            action: "issue.assignment_wakeup_requested",
+            entityType: "issue",
+            entityId: issue.id,
+            actor: {
+              actorAgentId: params.actorAgentId,
+              actorUserId: params.actorUserId,
+              actorRunId: params.actorRunId,
+            },
+            details: {
+              identifier: issue.identifier,
+              assigneeAgentId: issue.assigneeAgentId,
+              runId: existingWakeup.runId ?? null,
+              reason: params.reason ?? "plugin_issue_wakeup_requested",
+              contextSource,
+              idempotencyKey: params.idempotencyKey ?? null,
+              dedupedWakeupRequestId: existingWakeup.id,
+              dedupedWakeupStatus: existingWakeup.status,
+            },
+          });
+          return { queued: false, runId: existingWakeup.runId ?? null };
+        }
         const run = await heartbeat.wakeup(issue.assigneeAgentId, {
           source: "assignment",
           triggerDetail: "system",
@@ -1362,6 +1423,37 @@ export function buildHostServices(
             throw new Error(budgetBlock.reason);
           }
           const contextSource = params.contextSource ?? "plugin.issue.requestWakeups";
+          const idempotencyKey = params.idempotencyKeyPrefix ? `${params.idempotencyKeyPrefix}:${issue.id}` : null;
+          const existingWakeup = await findExistingPluginWakeup(
+            companyId,
+            issue.assigneeAgentId,
+            idempotencyKey,
+          );
+          if (existingWakeup) {
+            await logPluginActivity({
+              companyId,
+              action: "issue.assignment_wakeup_requested",
+              entityType: "issue",
+              entityId: issue.id,
+              actor: {
+                actorAgentId: params.actorAgentId,
+                actorUserId: params.actorUserId,
+                actorRunId: params.actorRunId,
+              },
+              details: {
+                identifier: issue.identifier,
+                assigneeAgentId: issue.assigneeAgentId,
+                runId: existingWakeup.runId ?? null,
+                reason: params.reason ?? "plugin_issue_wakeup_requested",
+                contextSource,
+                idempotencyKey,
+                dedupedWakeupRequestId: existingWakeup.id,
+                dedupedWakeupStatus: existingWakeup.status,
+              },
+            });
+            results.push({ issueId: issue.id, queued: false, runId: existingWakeup.runId ?? null });
+            continue;
+          }
           const run = await heartbeat.wakeup(issue.assigneeAgentId, {
             source: "assignment",
             triggerDetail: "system",
@@ -1373,7 +1465,7 @@ export function buildHostServices(
               pluginKey,
               contextSource,
             },
-            idempotencyKey: params.idempotencyKeyPrefix ? `${params.idempotencyKeyPrefix}:${issue.id}` : null,
+            idempotencyKey,
             requestedByActorType: "system",
             requestedByActorId: pluginId,
             contextSnapshot: {
