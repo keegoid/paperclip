@@ -193,6 +193,15 @@ describe("codex execute", () => {
       context: { wakeSource: "comment", wakeReason: "issue_commented" },
     },
     {
+      name: "a process-loss retry that inherited an unscoped timer context",
+      context: {
+        wakeSource: "timer",
+        wakeReason: "process_lost_retry",
+        retryReason: "process_lost",
+        retryOfRunId: "run-1",
+      },
+    },
+    {
       name: "an empty wake source",
       context: { wakeSource: "", wakeReason: "" },
     },
