@@ -90,6 +90,8 @@ type CapturePayload = {
   appendedSystemPromptFileContents?: string | null;
 };
 
+type ExecuteLogEntry = { stream: "stdout" | "stderr"; chunk: string };
+
 async function writeRetryThenSucceedClaudeCommand(commandPath: string): Promise<void> {
   const script = `#!/usr/bin/env node
 const fs = require("node:fs");
@@ -192,6 +194,47 @@ function createLocalSandboxRunner() {
   };
 }
 
+function parseStdoutJsonLogs(logs: ExecuteLogEntry[]): Array<Record<string, unknown>> {
+  return logs
+    .filter((entry) => entry.stream === "stdout")
+    .flatMap((entry) => entry.chunk.split(/\r?\n/))
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
+async function executeWithCapturedLogs(input: {
+  rootPrefix: string;
+  runId: string;
+  context: Record<string, unknown>;
+}): Promise<ExecuteLogEntry[]> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), input.rootPrefix));
+  const { workspace, commandPath, restore } = await setupExecuteEnv(root);
+  const logs: ExecuteLogEntry[] = [];
+  try {
+    await execute({
+      runId: input.runId,
+      agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: {
+        command: commandPath,
+        cwd: workspace,
+        promptTemplate: "Follow the heartbeat procedure.",
+      },
+      context: input.context,
+      authToken: "tok",
+      onLog: async (stream, chunk) => {
+        logs.push({ stream, chunk });
+      },
+      onMeta: async () => {},
+    });
+    return logs;
+  } finally {
+    restore();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}
+
 describe("claude execute", () => {
   /**
    * Regression tests for https://github.com/paperclipai/paperclip/issues/2848
@@ -231,42 +274,50 @@ describe("claude execute", () => {
   });
 
   it("emits a structured no_work line for unscoped timer fires before invoking Claude", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-exec-timer-no-work-"));
-    const { workspace, commandPath, restore } = await setupExecuteEnv(root);
-    const logs: Array<{ stream: "stdout" | "stderr"; chunk: string }> = [];
-    try {
-      await execute({
-        runId: "run-timer-no-work",
-        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: {} },
-        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
-        config: {
-          command: commandPath,
-          cwd: workspace,
-          promptTemplate: "Follow the heartbeat procedure.",
-        },
-        context: {
-          wakeSource: "timer",
-          wakeReason: "heartbeat_timer",
-        },
-        authToken: "tok",
-        onLog: async (stream, chunk) => {
-          logs.push({ stream, chunk });
-        },
-        onMeta: async () => {},
-      });
+    const logs = await executeWithCapturedLogs({
+      rootPrefix: "paperclip-claude-exec-timer-no-work-",
+      runId: "run-timer-no-work",
+      context: {
+        wakeSource: "timer",
+        wakeReason: "heartbeat_timer",
+      },
+    });
 
-      const firstStdout = logs.find((entry) => entry.stream === "stdout")?.chunk.trim();
-      expect(firstStdout).toBeTruthy();
-      expect(JSON.parse(firstStdout ?? "{}")).toMatchObject({
-        event: "no_work",
-        reason: "timer_no_scoped_work",
-        adapter: "claude_local",
-        runId: "run-timer-no-work",
-      });
-    } finally {
-      restore();
-      await fs.rm(root, { recursive: true, force: true });
-    }
+    const firstStdout = parseStdoutJsonLogs(logs)[0];
+    expect(firstStdout).toBeTruthy();
+    expect(firstStdout).toMatchObject({
+      event: "no_work",
+      reason: "timer_no_scoped_work",
+      adapter: "claude_local",
+      runId: "run-timer-no-work",
+    });
+  });
+
+  it.each([
+    {
+      name: "a scoped timer issue wake",
+      context: { wakeSource: "timer", wakeReason: "heartbeat_timer", issueId: "issue-1" },
+    },
+    {
+      name: "a non-timer wake source",
+      context: { wakeSource: "comment", wakeReason: "issue_commented" },
+    },
+    {
+      name: "an empty wake source",
+      context: { wakeSource: "", wakeReason: "" },
+    },
+  ])("does not emit the timer no_work line for $name", async ({ context }) => {
+    const logs = await executeWithCapturedLogs({
+      rootPrefix: "paperclip-claude-exec-no-timer-no-work-",
+      runId: "run-no-timer-no-work",
+      context,
+    });
+
+    const stdoutEvents = parseStdoutJsonLogs(logs);
+    expect(stdoutEvents[0]).toMatchObject({ type: "system", subtype: "init" });
+    expect(
+      stdoutEvents.some((event) => event.event === "no_work" && event.reason === "timer_no_scoped_work"),
+    ).toBe(false);
   });
 
   it("omits --append-system-prompt-file on a resumed session even when instructionsFile is set", async () => {
