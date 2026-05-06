@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, inArray, isNull, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -653,6 +653,32 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return row ?? null;
   }
 
+  async function latestActiveOutputSuppressionDecision(run: typeof heartbeatRuns.$inferSelect, now = new Date()) {
+    const silenceStartedAt = silenceStartedAtForRun(run);
+    const [row] = await db
+      .select()
+      .from(heartbeatRunWatchdogDecisions)
+      .where(
+        and(
+          eq(heartbeatRunWatchdogDecisions.companyId, run.companyId),
+          eq(heartbeatRunWatchdogDecisions.runId, run.id),
+          or(
+            and(
+              inArray(heartbeatRunWatchdogDecisions.decision, ["snooze", "continue"]),
+              gt(heartbeatRunWatchdogDecisions.snoozedUntil, now),
+            ),
+            and(
+              eq(heartbeatRunWatchdogDecisions.decision, "dismissed_false_positive"),
+              silenceStartedAt ? gte(heartbeatRunWatchdogDecisions.createdAt, silenceStartedAt) : undefined,
+            ),
+          ),
+        ),
+      )
+      .orderBy(desc(heartbeatRunWatchdogDecisions.createdAt))
+      .limit(1);
+    return row ?? null;
+  }
+
   async function findOpenStaleRunEvaluation(companyId: string, runId: string) {
     const [row] = await db
       .select({
@@ -1182,8 +1208,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     };
 
     for (const run of candidates) {
-      if (await latestActiveOutputQuietUntilDecision(run.companyId, run.id, now)) {
-        result.snoozed += 1;
+      const suppressionDecision = await latestActiveOutputSuppressionDecision(run, now);
+      if (suppressionDecision) {
+        if (suppressionDecision.decision === "dismissed_false_positive") result.skipped += 1;
+        else result.snoozed += 1;
         continue;
       }
       const outcome = await createOrUpdateStaleRunEvaluation({ run, now });
@@ -1306,6 +1334,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         createdByAgentId: input.actor.type === "agent" ? input.actor.agentId ?? null : null,
         createdByUserId: input.actor.type === "board" ? input.actor.userId ?? null : null,
         createdByRunId,
+        createdAt: decisionNow,
       })
       .returning();
 

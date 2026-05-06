@@ -103,6 +103,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     withOutput?: boolean;
     logChunk?: string;
     agentRuntimeConfig?: Record<string, unknown>;
+    processPid?: number | null;
   }) {
     const companyId = randomUUID();
     const managerId = randomUUID();
@@ -168,6 +169,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       lastOutputAt,
       lastOutputSeq: opts.withOutput ? 3 : 0,
       lastOutputStream: opts.withOutput ? "stdout" : null,
+      processPid: opts.processPid ?? null,
       contextSnapshot: { issueId },
       stdoutExcerpt: "OPENAI_API_KEY=sk-test-secret-value should not leak",
       logBytes: 0,
@@ -460,6 +462,56 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       .from(issues)
       .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
     expect(evaluations.filter((issue) => !["done", "cancelled"].includes(issue.status))).toHaveLength(1);
+  });
+
+  it("persists dismissed watchdog decisions across scan ticks for a dead pid", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, managerId, runId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+      processPid: 999_999_999,
+    });
+    const heartbeat = heartbeatService(db);
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn() });
+
+    const first = await heartbeat.scanSilentActiveRuns({ now, companyId });
+    const evaluationIssueId = first.evaluationIssueIds[0];
+    expect(first.created).toBe(1);
+    expect(evaluationIssueId).toBeTruthy();
+
+    await recovery.recordWatchdogDecision({
+      runId,
+      actor: { type: "agent", agentId: managerId },
+      decision: "dismissed_false_positive",
+      evaluationIssueId,
+      reason: "The local child pid is already dead and this run was triaged once.",
+      now: new Date(now.getTime() + 60_000),
+    });
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, evaluationIssueId));
+
+    const second = await heartbeat.scanSilentActiveRuns({
+      now: new Date(now.getTime() + 2 * 60_000),
+      companyId,
+    });
+    const third = await heartbeat.scanSilentActiveRuns({
+      now: new Date(now.getTime() + 3 * 60_000),
+      companyId,
+    });
+
+    expect(second.created).toBe(0);
+    expect(second.existing).toBe(0);
+    expect(second.evaluationIssueIds).toEqual([]);
+    expect(third.created).toBe(0);
+    expect(third.existing).toBe(0);
+    expect(third.evaluationIssueIds).toEqual([]);
+
+    const evaluations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
+    expect(evaluations).toHaveLength(1);
+    expect(evaluations[0]?.id).toBe(evaluationIssueId);
+    expect(evaluations[0]?.status).toBe("done");
   });
 
   it("suppresses recursive stale-run evaluations for a sole stale-run review assignment", async () => {

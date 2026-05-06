@@ -5804,6 +5804,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
+  function orphanedRunStalenessReferenceAt(
+    run: Pick<
+      typeof heartbeatRuns.$inferSelect,
+      "lastOutputAt" | "processStartedAt" | "startedAt" | "createdAt" | "updatedAt"
+    >,
+  ) {
+    return run.lastOutputAt ?? run.processStartedAt ?? run.startedAt ?? run.createdAt ?? run.updatedAt ?? null;
+  }
+
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
@@ -5828,7 +5837,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // Apply staleness threshold to avoid false positives. Runs already marked
       // detached have passed that gate and need bounded PID rechecks.
       if (staleThresholdMs > 0 && !isDetachedRun) {
-        const refTime = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
+        const refTime = orphanedRunStalenessReferenceAt(run)?.getTime() ?? 0;
         if (now.getTime() - refTime < staleThresholdMs) continue;
       }
 
