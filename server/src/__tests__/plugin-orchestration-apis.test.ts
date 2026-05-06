@@ -266,6 +266,73 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     ).rejects.toThrow("Issue is blocked by unresolved blockers");
   });
 
+  it("deduplicates plugin wakeups when the idempotency key already exists", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    const existingWakeupId = randomUUID();
+    const existingRunId = randomUUID();
+    const idempotencyKey = "review:keegoidllc/keegoid#39@28a4e05c:keegoid-cc";
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Review request",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+    await db.insert(agentWakeupRequests).values({
+      id: existingWakeupId,
+      companyId,
+      agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "opposite_pr_review_missing",
+      payload: { issueId },
+      status: "completed",
+      requestedByActorType: "system",
+      requestedByActorId: "plugin-record-id",
+      idempotencyKey,
+      runId: existingRunId,
+      finishedAt: new Date(),
+    });
+    await db.insert(heartbeatRuns).values({
+      id: existingRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "completed",
+      wakeupRequestId: existingWakeupId,
+      contextSnapshot: { issueId },
+      finishedAt: new Date(),
+    });
+
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+    const duplicate = await services.issues.requestWakeup({
+      issueId,
+      companyId,
+      reason: "opposite_pr_review_missing",
+      idempotencyKey,
+    });
+
+    expect(duplicate).toEqual({ queued: false, runId: existingRunId });
+
+    const matchingWakeups = await db
+      .select({
+        id: agentWakeupRequests.id,
+        idempotencyKey: agentWakeupRequests.idempotencyKey,
+        runId: agentWakeupRequests.runId,
+      })
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.agentId, agentId),
+        eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+      ));
+    expect(matchingWakeups).toHaveLength(1);
+    expect(matchingWakeups[0]?.runId).toBe(existingRunId);
+  });
+
   it("narrows orchestration cost summaries by subtree and billing code", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const rootIssueId = randomUUID();
