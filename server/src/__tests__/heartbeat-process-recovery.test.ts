@@ -929,6 +929,37 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(failedRun?.errorCode).toBe("process_lost");
   });
 
+  it("continues pid rechecks after detached activity clears the warning", async () => {
+    const now = new Date();
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "claude_local",
+      processPid: 999_999_999,
+      includeIssue: false,
+      startedAt: now,
+      processStartedAt: now,
+      updatedAt: now,
+    });
+    await db.insert(heartbeatRunEvents).values({
+      companyId,
+      agentId,
+      runId,
+      seq: 1,
+      eventType: "lifecycle",
+      stream: "system",
+      level: "info",
+      message: "Detached child process reported activity; cleared detached warning",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns({ staleThresholdMs: 60 * 60 * 1000 });
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("process_lost");
+  });
+
   it("uses run activity timestamps instead of updatedAt for orphan staleness", async () => {
     const processStartedAt = new Date(Date.now() - 60 * 60 * 1000);
     const { runId } = await seedRunFixture({

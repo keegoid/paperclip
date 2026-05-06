@@ -1080,6 +1080,24 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }) {
     const runningAgent = await getAgent(input.run.agentId);
     if (!runningAgent || runningAgent.companyId !== input.run.companyId) return { kind: "skipped" as const };
+    if (await isDeadDetachedActivityClearedRun({ run: input.run, runningAgent })) {
+      await logActivity(db, {
+        companyId: input.run.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: input.run.agentId,
+        runId: input.run.id,
+        action: "heartbeat.output_stale_dead_detached_skip",
+        entityType: "heartbeat_run",
+        entityId: input.run.id,
+        details: {
+          source: "recovery.scan_silent_active_runs",
+          processPid: input.run.processPid,
+          lastEvent: DETACHED_PROCESS_ACTIVITY_CLEARED_MESSAGE,
+        },
+      });
+      return { kind: "skipped" as const };
+    }
     const sourceIssue = await resolveStaleRunSourceIssue(input.run);
     if (await shouldSuppressRecursiveStaleRunEvaluation({ run: input.run, sourceIssue })) {
       await logActivity(db, {

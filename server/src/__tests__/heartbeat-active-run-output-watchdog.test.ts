@@ -5,6 +5,7 @@ import {
   agents,
   companies,
   createDb,
+  heartbeatRunEvents,
   heartbeatRunWatchdogDecisions,
   heartbeatRuns,
   issueRelations,
@@ -104,6 +105,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     logChunk?: string;
     agentRuntimeConfig?: Record<string, unknown>;
     processPid?: number | null;
+    adapterType?: string;
   }) {
     const companyId = randomUUID();
     const managerId = randomUUID();
@@ -139,7 +141,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
         role: "engineer",
         status: "running",
         reportsTo: managerId,
-        adapterType: "codex_local",
+        adapterType: opts.adapterType ?? "codex_local",
         adapterConfig: {},
         runtimeConfig: opts.agentRuntimeConfig ?? {},
         permissions: {},
@@ -224,6 +226,37 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     });
     expect(evaluations[0]?.description).toContain("Decision Checklist");
     expect(evaluations[0]?.description).not.toContain("sk-test-secret-value");
+  });
+
+  it("does not create an evaluation for a dead claude_local run after detached activity cleared", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, coderId, runId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+      adapterType: "claude_local",
+      processPid: 999_999_999,
+    });
+    await db.insert(heartbeatRunEvents).values({
+      companyId,
+      agentId: coderId,
+      runId,
+      seq: 1,
+      eventType: "lifecycle",
+      stream: "system",
+      level: "info",
+      message: "Detached child process reported activity; cleared detached warning",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.scanSilentActiveRuns({ now, companyId });
+
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(1);
+    const evaluations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
+    expect(evaluations).toHaveLength(0);
   });
 
   it("redacts sensitive values from actual run-log evidence", async () => {
