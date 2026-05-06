@@ -13,8 +13,8 @@ const {
   startAdapterExecutionTargetPaperclipBridge,
 } = vi.hoisted(() => ({
   runChildProcess: vi.fn(async () => ({
-    exitCode: 1,
-    signal: null,
+    exitCode: 1 as number | null,
+    signal: null as string | null,
     timedOut: false,
     stdout: "",
     stderr: "remote failure",

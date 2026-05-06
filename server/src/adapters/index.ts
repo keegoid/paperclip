@@ -16,6 +16,7 @@ export type {
   AdapterExecutionContext,
   AdapterExecutionResult,
   AdapterInvocationMeta,
+  AdapterLifecycleEvent,
   AdapterModelProfileDefinition,
   AdapterEnvironmentCheckLevel,
   AdapterEnvironmentCheck,
