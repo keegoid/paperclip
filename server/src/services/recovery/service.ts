@@ -31,6 +31,10 @@ import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
 import { issueService } from "../issues.js";
+import {
+  DETACHED_PROCESS_ACTIVITY_CLEARED_MESSAGE,
+  isTrackedLocalChildProcessAdapter,
+} from "../local-run-events.js";
 import { getRunLogStore } from "../run-log-store.js";
 import {
   RECOVERY_ORIGIN_KINDS,
@@ -54,8 +58,6 @@ const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
 const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.strandedIssueRecovery;
 const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiveRunEvaluation;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
-const DETACHED_PROCESS_ACTIVITY_CLEARED_MESSAGE =
-  "Detached child process reported activity; cleared detached warning";
 
 type RecoveryWakeupOptions = {
   source?: "timer" | "assignment" | "on_demand" | "automation";
@@ -72,6 +74,9 @@ type RecoveryWakeup = (
   agentId: string,
   opts?: RecoveryWakeupOptions,
 ) => Promise<typeof heartbeatRuns.$inferSelect | null>;
+type RecoveryDeadDetachedActivityClearedRun = (
+  run: typeof heartbeatRuns.$inferSelect,
+) => Promise<{ finalizedRunId: string; retryRunId?: string | null } | null>;
 
 type LatestIssueRun = Pick<
   typeof heartbeatRuns.$inferSelect,
@@ -349,7 +354,13 @@ function buildLivenessOriginalIssueComment(finding: IssueLivenessFinding, escala
   ].join("\n");
 }
 
-export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup }) {
+export function recoveryService(
+  db: Db,
+  deps: {
+    enqueueWakeup: RecoveryWakeup;
+    finalizeDeadDetachedActivityClearedRun?: RecoveryDeadDetachedActivityClearedRun;
+  },
+) {
   const issuesSvc = issueService(db);
   const treeControlSvc = issueTreeControlService(db);
   const budgets = budgetService(db);
@@ -727,7 +738,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     run: typeof heartbeatRuns.$inferSelect;
     runningAgent: typeof agents.$inferSelect;
   }) {
-    if (input.runningAgent.adapterType !== "claude_local") return false;
+    if (!isTrackedLocalChildProcessAdapter(input.runningAgent.adapterType)) return false;
     if (runningProcesses.has(input.run.id)) return false;
     if (!input.run.processPid) return false;
 
@@ -1081,6 +1092,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     const runningAgent = await getAgent(input.run.agentId);
     if (!runningAgent || runningAgent.companyId !== input.run.companyId) return { kind: "skipped" as const };
     if (await isDeadDetachedActivityClearedRun({ run: input.run, runningAgent })) {
+      const finalization = await deps.finalizeDeadDetachedActivityClearedRun?.(input.run);
       await logActivity(db, {
         companyId: input.run.companyId,
         actorType: "system",
@@ -1094,6 +1106,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           source: "recovery.scan_silent_active_runs",
           processPid: input.run.processPid,
           lastEvent: DETACHED_PROCESS_ACTIVITY_CLEARED_MESSAGE,
+          finalizedRunId: finalization?.finalizedRunId ?? null,
+          retryRunId: finalization?.retryRunId ?? null,
         },
       });
       return { kind: "skipped" as const };

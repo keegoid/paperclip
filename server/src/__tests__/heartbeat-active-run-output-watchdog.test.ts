@@ -25,6 +25,7 @@ import {
   ACTIVE_RUN_OUTPUT_INTERVAL_CRITICAL_MULTIPLIER,
   recoveryService,
 } from "../services/recovery/service.ts";
+import { DETACHED_PROCESS_ACTIVITY_CLEARED_MESSAGE } from "../services/local-run-events.ts";
 import { getRunLogStore } from "../services/run-log-store.ts";
 
 const mockAdapterExecute = vi.hoisted(() =>
@@ -105,7 +106,9 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     logChunk?: string;
     agentRuntimeConfig?: Record<string, unknown>;
     processPid?: number | null;
+    processLossRetryCount?: number;
     adapterType?: string;
+    issueStatus?: string;
   }) {
     const companyId = randomUUID();
     const managerId = randomUUID();
@@ -151,7 +154,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       id: issueId,
       companyId,
       title: "Long running implementation",
-      status: "in_progress",
+      status: opts.issueStatus ?? "in_progress",
       priority: "medium",
       assigneeAgentId: coderId,
       issueNumber: 1,
@@ -172,6 +175,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       lastOutputSeq: opts.withOutput ? 3 : 0,
       lastOutputStream: opts.withOutput ? "stdout" : null,
       processPid: opts.processPid ?? null,
+      processLossRetryCount: opts.processLossRetryCount ?? 0,
       contextSnapshot: { issueId },
       stdoutExcerpt: "OPENAI_API_KEY=sk-test-secret-value should not leak",
       logBytes: 0,
@@ -228,36 +232,61 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     expect(evaluations[0]?.description).not.toContain("sk-test-secret-value");
   });
 
-  it("does not create an evaluation for a dead claude_local run after detached activity cleared", async () => {
-    const now = new Date("2026-04-22T20:00:00.000Z");
-    const { companyId, coderId, runId } = await seedRunningRun({
-      now,
-      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
-      adapterType: "claude_local",
-      processPid: 999_999_999,
-    });
-    await db.insert(heartbeatRunEvents).values({
-      companyId,
-      agentId: coderId,
-      runId,
-      seq: 1,
-      eventType: "lifecycle",
-      stream: "system",
-      level: "info",
-      message: "Detached child process reported activity; cleared detached warning",
-    });
-    const heartbeat = heartbeatService(db);
+  it.each(["claude_local", "codex_local"] as const)(
+    "does not create an evaluation for a dead %s run after detached activity cleared",
+    async (adapterType) => {
+      const now = new Date("2026-04-22T20:00:00.000Z");
+      const { companyId, coderId, issueId, runId } = await seedRunningRun({
+        now,
+        ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+        adapterType,
+        processPid: 999_999_999,
+        processLossRetryCount: 1,
+        issueStatus: "todo",
+      });
+      await db.insert(heartbeatRunEvents).values({
+        companyId,
+        agentId: coderId,
+        runId,
+        seq: 1,
+        eventType: "lifecycle",
+        stream: "system",
+        level: "info",
+        message: DETACHED_PROCESS_ACTIVITY_CLEARED_MESSAGE,
+      });
+      const heartbeat = heartbeatService(db);
 
-    const result = await heartbeat.scanSilentActiveRuns({ now, companyId });
+      const result = await heartbeat.scanSilentActiveRuns({ now, companyId });
 
-    expect(result.created).toBe(0);
-    expect(result.skipped).toBe(1);
-    const evaluations = await db
-      .select()
-      .from(issues)
-      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
-    expect(evaluations).toHaveLength(0);
-  });
+      expect(result.created).toBe(0);
+      expect(result.skipped).toBe(1);
+      const evaluations = await db
+        .select()
+        .from(issues)
+        .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
+      expect(evaluations).toHaveLength(0);
+
+      const [failedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(failedRun?.status).toBe("failed");
+      expect(failedRun?.errorCode).toBe("process_lost");
+
+      const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(sourceIssue?.executionRunId).not.toBe(runId);
+      expect(sourceIssue?.executionLockedAt).not.toEqual(now);
+
+      const [recoveryRun] = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.retryOfRunId, runId)));
+      expect(recoveryRun?.status).toBe("queued");
+      expect(sourceIssue?.executionRunId).toBe(recoveryRun?.id ?? null);
+
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "cancelled" })
+        .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.status, "queued")));
+    },
+  );
 
   it("redacts sensitive values from actual run-log evidence", async () => {
     const now = new Date("2026-04-22T20:00:00.000Z");

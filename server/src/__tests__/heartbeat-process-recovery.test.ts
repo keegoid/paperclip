@@ -30,6 +30,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { runningProcesses } from "../adapters/index.ts";
+import { DETACHED_PROCESS_ACTIVITY_CLEARED_MESSAGE } from "../services/local-run-events.ts";
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 const mockTrackAgentFirstHeartbeat = vi.hoisted(() => vi.fn());
 const mockAdapterExecute = vi.hoisted(() =>
@@ -947,7 +948,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       eventType: "lifecycle",
       stream: "system",
       level: "info",
-      message: "Detached child process reported activity; cleared detached warning",
+      message: DETACHED_PROCESS_ACTIVITY_CLEARED_MESSAGE,
     });
     const heartbeat = heartbeatService(db);
 
