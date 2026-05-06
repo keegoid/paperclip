@@ -110,6 +110,7 @@ import { workspaceOperationService } from "./workspace-operations.js";
 import { isProcessGroupAlive, terminateLocalService } from "./local-service-supervisor.js";
 import {
   DETACHED_PROCESS_ACTIVITY_CLEARED_MESSAGE,
+  isRecordedLocalChildProcessAlive,
   isTrackedLocalChildProcessAdapter,
 } from "./local-run-events.js";
 import {
@@ -5959,8 +5960,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const agent = await getAgent(currentRun.agentId);
     if (!agent || !isTrackedLocalChildProcessAdapter(agent.adapterType)) return null;
     if (runningProcesses.has(currentRun.id) || activeRunExecutions.has(currentRun.id)) return null;
-    if (currentRun.processPid && isProcessAlive(currentRun.processPid)) return null;
-    if (currentRun.processGroupId && isProcessGroupAlive(currentRun.processGroupId)) return null;
+    if (isRecordedLocalChildProcessAlive({
+      processPid: currentRun.processPid,
+      processGroupId: currentRun.processGroupId,
+      isProcessAlive,
+      isProcessGroupAlive,
+    })) {
+      return null;
+    }
 
     const now = opts?.now ?? new Date();
     const reason =
@@ -5989,6 +5996,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       status: finalizedRun.status,
       failureReason: finalizedRun.error ?? undefined,
     });
+    // Watchdog cleanup releases this stale run only; normal scheduling owns the next queued run.
     await releaseIssueExecutionAndPromote(finalizedRun, {
       startQueuedRuns: false,
     });

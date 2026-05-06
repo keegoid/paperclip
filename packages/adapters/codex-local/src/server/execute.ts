@@ -701,6 +701,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       })}\n`,
     );
   };
+  const emitLifecycle = async (
+    event: Parameters<NonNullable<AdapterExecutionContext["onLifecycle"]>>[0],
+  ) => {
+    if (!onLifecycle) return;
+    try {
+      await onLifecycle(event);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      await onLog("stderr", `[paperclip] Failed to record Codex lifecycle event: ${reason}\n`).catch(() => undefined);
+    }
+  };
 
   const runAttempt = async (resumeSessionId: string | null) => {
     const execArgs = buildCodexExecArgs(
@@ -730,24 +741,36 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
     await emitTimerNoWorkEvent();
 
-    const proc = await runAdapterExecutionTargetProcess(runId, executionTarget, command, args, {
-      cwd,
-      env,
-      stdin: prompt,
-      timeoutSec,
-      graceSec,
-      onSpawn,
-      onLog: async (stream, chunk) => {
-        if (stream !== "stderr") {
-          await onLog(stream, chunk);
-          return;
-        }
-        const cleaned = stripCodexRolloutNoise(chunk);
-        if (!cleaned.trim()) return;
-        await onLog(stream, cleaned);
-      },
-    });
-    await onLifecycle?.({
+    let proc: Awaited<ReturnType<typeof runAdapterExecutionTargetProcess>>;
+    try {
+      proc = await runAdapterExecutionTargetProcess(runId, executionTarget, command, args, {
+        cwd,
+        env,
+        stdin: prompt,
+        timeoutSec,
+        graceSec,
+        onSpawn,
+        onLog: async (stream, chunk) => {
+          if (stream !== "stderr") {
+            await onLog(stream, chunk);
+            return;
+          }
+          const cleaned = stripCodexRolloutNoise(chunk);
+          if (!cleaned.trim()) return;
+          await onLog(stream, cleaned);
+        },
+      });
+    } catch (err) {
+      await emitLifecycle({
+        level: "error",
+        message: "codex process failed before exit",
+        payload: {
+          error: err instanceof Error ? err.message : String(err),
+        },
+      });
+      throw err;
+    }
+    await emitLifecycle({
       level: proc.timedOut || proc.signal || (proc.exitCode ?? 0) !== 0 ? "error" : "info",
       message: "codex process exited",
       payload: {
@@ -804,13 +827,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : null;
     const parsedError = typeof attempt.parsed.errorMessage === "string" ? attempt.parsed.errorMessage.trim() : "";
     const stderrLine = firstNonEmptyLine(attempt.proc.stderr);
+    const signalMessage = attempt.proc.signal ? `Codex process terminated by signal ${attempt.proc.signal}` : "";
     const fallbackErrorMessage =
       parsedError ||
       stderrLine ||
+      signalMessage ||
       `Codex exited with code ${attempt.proc.exitCode ?? -1}`;
     const processFailed = attempt.proc.signal != null || (attempt.proc.exitCode ?? 0) !== 0;
+    const processEndedBySignal = attempt.proc.signal != null;
     const transientRetryNotBefore =
-      processFailed
+      processFailed && !processEndedBySignal
         ? extractCodexRetryNotBefore({
             stdout: attempt.proc.stdout,
             stderr: attempt.proc.stderr,
@@ -819,6 +845,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         : null;
     const transientUpstream =
       processFailed &&
+      !processEndedBySignal &&
       isCodexTransientUpstreamError({
         stdout: attempt.proc.stdout,
         stderr: attempt.proc.stderr,

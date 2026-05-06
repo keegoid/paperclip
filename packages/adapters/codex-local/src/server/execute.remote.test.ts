@@ -85,9 +85,34 @@ describe("codex remote execution", () => {
   });
 
   it.each([
-    { exitCode: 0, signal: null, expectedLevel: "info" as const },
-    { exitCode: null, signal: "SIGTERM", expectedLevel: "error" as const },
-  ])("emits a terminal lifecycle event when the Codex process exits with %j", async ({ exitCode, signal, expectedLevel }) => {
+    {
+      exitCode: 0,
+      signal: null,
+      stderr: "",
+      expectedLevel: "info" as const,
+      expectedErrorMessage: null,
+    },
+    {
+      exitCode: null,
+      signal: "SIGTERM",
+      stderr: "",
+      expectedLevel: "error" as const,
+      expectedErrorMessage: "Codex process terminated by signal SIGTERM",
+    },
+    {
+      exitCode: null,
+      signal: "SIGTERM",
+      stderr: "temporary errors from remote compact task",
+      expectedLevel: "error" as const,
+      expectedErrorMessage: "temporary errors from remote compact task",
+    },
+  ])("emits a terminal lifecycle event when the Codex process exits with %j", async ({
+    exitCode,
+    signal,
+    stderr,
+    expectedLevel,
+    expectedErrorMessage,
+  }) => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-lifecycle-"));
     cleanupDirs.push(rootDir);
     const workspaceDir = path.join(rootDir, "workspace");
@@ -99,13 +124,13 @@ describe("codex remote execution", () => {
       signal,
       timedOut: false,
       stdout: JSON.stringify({ type: "turn.completed" }),
-      stderr: "",
+      stderr,
       pid: 456,
       startedAt: "2026-04-22T20:00:00.000Z",
     });
     const lifecycleEvents: unknown[] = [];
 
-    await execute({
+    const result = await execute({
       runId: "run-lifecycle",
       agent: {
         id: "agent-1",
@@ -138,6 +163,10 @@ describe("codex remote execution", () => {
       },
     });
 
+    expect(result.errorMessage).toBe(expectedErrorMessage);
+    expect(result.errorCode).toBeNull();
+    expect(result.errorFamily).toBeNull();
+    expect(result.retryNotBefore).toBeNull();
     expect(lifecycleEvents).toContainEqual({
       level: expectedLevel,
       message: "codex process exited",
@@ -148,6 +177,118 @@ describe("codex remote execution", () => {
         pid: 456,
         startedAt: "2026-04-22T20:00:00.000Z",
       },
+    });
+  });
+
+  it("emits a terminal lifecycle event when spawning Codex throws", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-spawn-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    const codexHomeDir = path.join(rootDir, "codex-home");
+    await mkdir(workspaceDir, { recursive: true });
+    await mkdir(codexHomeDir, { recursive: true });
+    runChildProcess.mockRejectedValueOnce(new Error("spawn failed"));
+    const lifecycleEvents: unknown[] = [];
+
+    await expect(execute({
+      runId: "run-spawn-failed",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "CodexCoder",
+        adapterType: "codex_local",
+        adapterConfig: {},
+      },
+      runtime: {
+        sessionId: null,
+        sessionParams: null,
+        sessionDisplayId: null,
+        taskKey: null,
+      },
+      config: {
+        command: "codex",
+        env: {
+          CODEX_HOME: codexHomeDir,
+        },
+      },
+      context: {
+        paperclipWorkspace: {
+          cwd: workspaceDir,
+          source: "project_primary",
+        },
+      },
+      onLog: async () => {},
+      onLifecycle: async (event) => {
+        lifecycleEvents.push(event);
+      },
+    })).rejects.toThrow("spawn failed");
+
+    expect(lifecycleEvents).toContainEqual({
+      level: "error",
+      message: "codex process failed before exit",
+      payload: {
+        error: "spawn failed",
+      },
+    });
+  });
+
+  it("does not fail execution when lifecycle handling throws", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-lifecycle-throw-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    const codexHomeDir = path.join(rootDir, "codex-home");
+    await mkdir(workspaceDir, { recursive: true });
+    await mkdir(codexHomeDir, { recursive: true });
+    runChildProcess.mockResolvedValueOnce({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: JSON.stringify({ type: "turn.completed" }),
+      stderr: "",
+      pid: 456,
+      startedAt: "2026-04-22T20:00:00.000Z",
+    });
+    const logLines: Array<{ stream: string; chunk: string }> = [];
+
+    const result = await execute({
+      runId: "run-lifecycle-throw",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "CodexCoder",
+        adapterType: "codex_local",
+        adapterConfig: {},
+      },
+      runtime: {
+        sessionId: null,
+        sessionParams: null,
+        sessionDisplayId: null,
+        taskKey: null,
+      },
+      config: {
+        command: "codex",
+        env: {
+          CODEX_HOME: codexHomeDir,
+        },
+      },
+      context: {
+        paperclipWorkspace: {
+          cwd: workspaceDir,
+          source: "project_primary",
+        },
+      },
+      onLog: async (stream, chunk) => {
+        logLines.push({ stream, chunk });
+      },
+      onLifecycle: async () => {
+        throw new Error("lifecycle sink unavailable");
+      },
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(logLines).toContainEqual({
+      stream: "stderr",
+      chunk: "[paperclip] Failed to record Codex lifecycle event: lifecycle sink unavailable\n",
     });
   });
 
