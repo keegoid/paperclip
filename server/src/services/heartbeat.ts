@@ -5909,7 +5909,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return { finalizedRun, retriedRun };
   }
 
-  async function finalizeDeadDetachedActivityClearedRun(run: typeof heartbeatRuns.$inferSelect) {
+  async function finalizeDeadDetachedActivityClearedRun(
+    run: typeof heartbeatRuns.$inferSelect,
+    opts?: { now?: Date },
+  ) {
     const currentRun = await getRun(run.id, { unsafeFullResultJson: true });
     if (!currentRun || currentRun.status !== "running") return null;
     const agent = await getAgent(currentRun.agentId);
@@ -5934,7 +5937,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const result = await finalizeLostLocalChildRun({
       run: currentRun,
       agent,
-      now: new Date(),
+      now: opts?.now ?? new Date(),
       descendantOnlyCleanup,
       startQueuedRuns: false,
     });

@@ -76,6 +76,7 @@ type RecoveryWakeup = (
 ) => Promise<typeof heartbeatRuns.$inferSelect | null>;
 type RecoveryDeadDetachedActivityClearedRun = (
   run: typeof heartbeatRuns.$inferSelect,
+  opts?: { now?: Date },
 ) => Promise<{ finalizedRunId: string; retryRunId?: string | null } | null>;
 
 type LatestIssueRun = Pick<
@@ -681,7 +682,6 @@ export function recoveryService(
 
   async function latestActiveOutputDismissalDecision(run: typeof heartbeatRuns.$inferSelect) {
     const silenceStartedAt = silenceStartedAtForRun(run);
-    if (!silenceStartedAt) return null;
 
     const [row] = await db
       .select()
@@ -691,7 +691,10 @@ export function recoveryService(
           eq(heartbeatRunWatchdogDecisions.companyId, run.companyId),
           eq(heartbeatRunWatchdogDecisions.runId, run.id),
           eq(heartbeatRunWatchdogDecisions.decision, "dismissed_false_positive"),
-          gte(heartbeatRunWatchdogDecisions.createdAt, silenceStartedAt),
+          // Normal rows are interval-scoped by run activity/start timestamps.
+          // If an old/corrupt row has no anchor, keep the explicit run-level
+          // dismissal dedup instead of minting repeat evaluations.
+          silenceStartedAt ? gte(heartbeatRunWatchdogDecisions.createdAt, silenceStartedAt) : undefined,
         ),
       )
       .orderBy(desc(heartbeatRunWatchdogDecisions.createdAt))
@@ -1092,7 +1095,7 @@ export function recoveryService(
     const runningAgent = await getAgent(input.run.agentId);
     if (!runningAgent || runningAgent.companyId !== input.run.companyId) return { kind: "skipped" as const };
     if (await isDeadDetachedActivityClearedRun({ run: input.run, runningAgent })) {
-      const finalization = await deps.finalizeDeadDetachedActivityClearedRun?.(input.run);
+      const finalization = await deps.finalizeDeadDetachedActivityClearedRun?.(input.run, { now: input.now });
       await logActivity(db, {
         companyId: input.run.companyId,
         actorType: "system",
