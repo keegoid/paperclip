@@ -84,6 +84,73 @@ describe("codex remote execution", () => {
     }
   });
 
+  it.each([
+    { exitCode: 0, signal: null, expectedLevel: "info" as const },
+    { exitCode: null, signal: "SIGTERM", expectedLevel: "error" as const },
+  ])("emits a terminal lifecycle event when the Codex process exits with %j", async ({ exitCode, signal, expectedLevel }) => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-lifecycle-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    const codexHomeDir = path.join(rootDir, "codex-home");
+    await mkdir(workspaceDir, { recursive: true });
+    await mkdir(codexHomeDir, { recursive: true });
+    runChildProcess.mockResolvedValueOnce({
+      exitCode,
+      signal,
+      timedOut: false,
+      stdout: JSON.stringify({ type: "turn.completed" }),
+      stderr: "",
+      pid: 456,
+      startedAt: "2026-04-22T20:00:00.000Z",
+    });
+    const lifecycleEvents: unknown[] = [];
+
+    await execute({
+      runId: "run-lifecycle",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "CodexCoder",
+        adapterType: "codex_local",
+        adapterConfig: {},
+      },
+      runtime: {
+        sessionId: null,
+        sessionParams: null,
+        sessionDisplayId: null,
+        taskKey: null,
+      },
+      config: {
+        command: "codex",
+        env: {
+          CODEX_HOME: codexHomeDir,
+        },
+      },
+      context: {
+        paperclipWorkspace: {
+          cwd: workspaceDir,
+          source: "project_primary",
+        },
+      },
+      onLog: async () => {},
+      onLifecycle: async (event) => {
+        lifecycleEvents.push(event);
+      },
+    });
+
+    expect(lifecycleEvents).toContainEqual({
+      level: expectedLevel,
+      message: "codex process exited",
+      payload: {
+        exitCode,
+        signal,
+        timedOut: false,
+        pid: 456,
+        startedAt: "2026-04-22T20:00:00.000Z",
+      },
+    });
+  });
+
   it("prepares the workspace, syncs CODEX_HOME, and restores workspace changes for remote SSH execution", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-remote-"));
     cleanupDirs.push(rootDir);

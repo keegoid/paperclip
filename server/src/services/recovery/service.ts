@@ -78,6 +78,10 @@ type RecoveryDeadDetachedActivityClearedRun = (
   run: typeof heartbeatRuns.$inferSelect,
   opts?: { now?: Date },
 ) => Promise<{ finalizedRunId: string; retryRunId?: string | null } | null>;
+type RecoveryStaleTerminatedRun = (
+  run: typeof heartbeatRuns.$inferSelect,
+  opts?: { now?: Date; sourceIssueId?: string | null },
+) => Promise<{ finalizedRunId: string } | null>;
 
 type LatestIssueRun = Pick<
   typeof heartbeatRuns.$inferSelect,
@@ -360,6 +364,7 @@ export function recoveryService(
   deps: {
     enqueueWakeup: RecoveryWakeup;
     finalizeDeadDetachedActivityClearedRun?: RecoveryDeadDetachedActivityClearedRun;
+    finalizeStaleTerminatedRun?: RecoveryStaleTerminatedRun;
   },
 ) {
   const issuesSvc = issueService(db);
@@ -922,6 +927,7 @@ export function recoveryService(
     const silenceAgeMs = silenceAgeMsForRun(input.run, input.now);
     return {
       safeTail,
+      tailEmpty: tail.trim().length === 0,
       silenceAgeMs,
       recentEvents: recentEvents.reverse().map((event) => ({
         eventType: event.eventType,
@@ -1088,6 +1094,27 @@ export function recoveryService(
     return activeAssignments.length === 1 && activeAssignments[0]?.id === input.sourceIssue.id;
   }
 
+  function isTerminalIssueStatus(status: string | null | undefined) {
+    return status === "done" || status === "cancelled";
+  }
+
+  function shouldAutoTerminateStaleRun(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    runningAgent: typeof agents.$inferSelect;
+    sourceIssue: typeof issues.$inferSelect | null;
+    evidence: Awaited<ReturnType<typeof collectStaleRunEvidence>>;
+    level: "suspicious" | "critical";
+  }) {
+    if (input.level !== "critical") return false;
+    if (!isTrackedLocalChildProcessAdapter(input.runningAgent.adapterType)) return false;
+    if (runningProcesses.has(input.run.id)) return false;
+    if (input.run.processPid && isProcessAlive(input.run.processPid)) return false;
+    if (!input.evidence.tailEmpty) return false;
+    if (input.sourceIssue && !isTerminalIssueStatus(input.sourceIssue.status)) return false;
+    if (input.evidence.childIssues.some((issue) => !isTerminalIssueStatus(issue.status))) return false;
+    return true;
+  }
+
   async function createOrUpdateStaleRunEvaluation(input: {
     run: typeof heartbeatRuns.$inferSelect;
     now: Date;
@@ -1147,6 +1174,38 @@ export function recoveryService(
       now: input.now,
     });
     const level = (evidence.silenceAgeMs ?? 0) >= thresholds.criticalThresholdMs ? "critical" : "suspicious";
+    if (shouldAutoTerminateStaleRun({
+      run: input.run,
+      runningAgent,
+      sourceIssue,
+      evidence,
+      level,
+    })) {
+      const finalization = await deps.finalizeStaleTerminatedRun?.(input.run, {
+        now: input.now,
+        sourceIssueId: sourceIssue?.id ?? null,
+      });
+      if (finalization) {
+        await logActivity(db, {
+          companyId: input.run.companyId,
+          actorType: "system",
+          actorId: "system",
+          agentId: input.run.agentId,
+          runId: input.run.id,
+          action: "heartbeat.output_stale_auto_terminated",
+          entityType: "heartbeat_run",
+          entityId: input.run.id,
+          details: {
+            source: "recovery.scan_silent_active_runs",
+            processPid: input.run.processPid,
+            sourceIssueId: sourceIssue?.id ?? null,
+            finalizedRunId: finalization.finalizedRunId,
+            silenceAgeMs: evidence.silenceAgeMs,
+          },
+        });
+        return { kind: "skipped" as const };
+      }
+    }
     const existing = await findOpenStaleRunEvaluation(input.run.companyId, input.run.id);
     if (existing) {
       if (level === "critical" && existing.priority !== "high") {

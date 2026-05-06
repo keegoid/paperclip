@@ -47,6 +47,7 @@ import { getServerAdapter, listAdapterModelProfiles, runningProcesses } from "..
 import type {
   AdapterExecutionResult,
   AdapterInvocationMeta,
+  AdapterLifecycleEvent,
   AdapterModelProfileDefinition,
   AdapterSessionCodec,
   UsageSummary,
@@ -2219,6 +2220,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   const recovery = recoveryService(db, {
     enqueueWakeup,
     finalizeDeadDetachedActivityClearedRun,
+    finalizeStaleTerminatedRun,
   });
   const productivityReviews = productivityReviewService(db, { enqueueWakeup });
   let unsafeTextProjectionPromise: Promise<boolean> | null = null;
@@ -5948,6 +5950,66 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
   }
 
+  async function finalizeStaleTerminatedRun(
+    run: typeof heartbeatRuns.$inferSelect,
+    opts?: { now?: Date; sourceIssueId?: string | null },
+  ) {
+    const currentRun = await getRun(run.id, { unsafeFullResultJson: true });
+    if (!currentRun || currentRun.status !== "running") return null;
+    const agent = await getAgent(currentRun.agentId);
+    if (!agent || !isTrackedLocalChildProcessAdapter(agent.adapterType)) return null;
+    if (runningProcesses.has(currentRun.id) || activeRunExecutions.has(currentRun.id)) return null;
+    if (currentRun.processPid && isProcessAlive(currentRun.processPid)) return null;
+    if (currentRun.processGroupId && isProcessGroupAlive(currentRun.processGroupId)) return null;
+
+    const now = opts?.now ?? new Date();
+    const reason =
+      "Automatically terminated stale active run after the recorded local child process was gone and no preservable output/source work was found";
+    let finalizedRun = await setRunStatus(currentRun.id, "cancelled", {
+      finishedAt: now,
+      error: reason,
+      errorCode: "stale_terminated",
+      resultJson: mergeRunStopMetadataForAgent(agent, "cancelled", {
+        resultJson: parseObject(currentRun.resultJson),
+        errorCode: "stale_terminated",
+        errorMessage: reason,
+      }),
+    });
+    await setWakeupStatus(currentRun.wakeupRequestId, "cancelled", {
+      finishedAt: now,
+      error: reason,
+    });
+    if (!finalizedRun) finalizedRun = await getRun(currentRun.id, { unsafeFullResultJson: true });
+    if (!finalizedRun) return null;
+    finalizedRun = await classifyAndPersistRunLiveness(finalizedRun, parseObject(finalizedRun.resultJson)) ?? finalizedRun;
+    await releaseEnvironmentLeasesForRun({
+      runId: finalizedRun.id,
+      companyId: finalizedRun.companyId,
+      agentId: finalizedRun.agentId,
+      status: finalizedRun.status,
+      failureReason: finalizedRun.error ?? undefined,
+    });
+    await releaseIssueExecutionAndPromote(finalizedRun, {
+      startQueuedRuns: false,
+    });
+    await appendRunEvent(finalizedRun, await nextRunEventSeq(finalizedRun.id), {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "warn",
+      message: "stale_terminated",
+      payload: {
+        ...(currentRun.processPid ? { processPid: currentRun.processPid } : {}),
+        ...(currentRun.processGroupId ? { processGroupId: currentRun.processGroupId } : {}),
+        ...(opts?.sourceIssueId ? { sourceIssueId: opts.sourceIssueId } : {}),
+        reason,
+      },
+    });
+    await finalizeAgentStatus(currentRun.agentId, "cancelled");
+    runningProcesses.delete(currentRun.id);
+
+    return { finalizedRunId: finalizedRun.id };
+  }
+
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
@@ -7086,6 +7148,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           },
         });
       };
+      const onAdapterLifecycle = async (event: AdapterLifecycleEvent) => {
+        await appendRunEvent(currentRun, seq++, {
+          eventType: "lifecycle",
+          stream: "system",
+          level: event.level ?? "info",
+          message: event.message,
+          payload: event.payload,
+        });
+      };
 
       const adapter = getServerAdapter(agent.adapterType);
       const authToken = adapter.supportsLocalAgentJwt
@@ -7115,6 +7186,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           : undefined,
         onLog,
         onMeta: onAdapterMeta,
+        onLifecycle: onAdapterLifecycle,
         onSpawn: async (meta) => {
           await persistRunProcessMetadata(run.id, {
             pid: meta.pid,

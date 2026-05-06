@@ -8,6 +8,7 @@ export type {
   UsageSummary,
   AdapterExecutionResult,
   AdapterInvocationMeta,
+  AdapterLifecycleEvent,
   AdapterExecutionContext,
   AdapterEnvironmentCheckLevel,
   AdapterEnvironmentCheck,

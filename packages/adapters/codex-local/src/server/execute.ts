@@ -315,7 +315,7 @@ export async function ensureCodexSkillsInjected(
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
-  const { runId, agent, runtime, config, context, onLog, onMeta, onSpawn, authToken } = ctx;
+  const { runId, agent, runtime, config, context, onLog, onMeta, onLifecycle, onSpawn, authToken } = ctx;
 
   const promptTemplate = asString(
     config.promptTemplate,
@@ -747,6 +747,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         await onLog(stream, cleaned);
       },
     });
+    await onLifecycle?.({
+      level: proc.timedOut || proc.signal || (proc.exitCode ?? 0) !== 0 ? "error" : "info",
+      message: "codex process exited",
+      payload: {
+        exitCode: proc.exitCode,
+        signal: proc.signal,
+        timedOut: proc.timedOut,
+        pid: proc.pid,
+        startedAt: proc.startedAt,
+      },
+    });
     const cleanedStderr = stripCodexRolloutNoise(proc.stderr);
     return {
       proc: {
@@ -797,8 +808,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       parsedError ||
       stderrLine ||
       `Codex exited with code ${attempt.proc.exitCode ?? -1}`;
+    const processFailed = attempt.proc.signal != null || (attempt.proc.exitCode ?? 0) !== 0;
     const transientRetryNotBefore =
-      (attempt.proc.exitCode ?? 0) !== 0
+      processFailed
         ? extractCodexRetryNotBefore({
             stdout: attempt.proc.stdout,
             stderr: attempt.proc.stderr,
@@ -806,7 +818,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           })
         : null;
     const transientUpstream =
-      (attempt.proc.exitCode ?? 0) !== 0 &&
+      processFailed &&
       isCodexTransientUpstreamError({
         stdout: attempt.proc.stdout,
         stderr: attempt.proc.stderr,
@@ -818,9 +830,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       signal: attempt.proc.signal,
       timedOut: false,
       errorMessage:
-        (attempt.proc.exitCode ?? 0) === 0
-          ? null
-          : fallbackErrorMessage,
+        processFailed ? fallbackErrorMessage : null,
       errorCode:
         transientUpstream
           ? "codex_transient_upstream"
