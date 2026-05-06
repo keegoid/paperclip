@@ -771,6 +771,24 @@ const heartbeatRunLogAccessColumns = {
   logRef: heartbeatRuns.logRef,
 } as const;
 
+export function buildHeartbeatRunProcessDiagnostics(run: Pick<
+  typeof heartbeatRuns.$inferSelect,
+  "startedAt" | "processStartedAt"
+>) {
+  const runStartedAt = run.startedAt ?? null;
+  const processStartedAt = run.processStartedAt ?? null;
+  const processStartedBeforeRunByMs =
+    runStartedAt && processStartedAt
+      ? Math.max(0, runStartedAt.getTime() - processStartedAt.getTime())
+      : null;
+  return {
+    runStartedAt,
+    processStartedAt,
+    processStartedBeforeRun: (processStartedBeforeRunByMs ?? 0) > 0,
+    processStartedBeforeRunByMs,
+  };
+}
+
 const heartbeatRunIssueSummaryColumns = {
   id: heartbeatRuns.id,
   status: heartbeatRuns.status,
@@ -5955,11 +5973,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function buildRunOutputSilence(
     run: Pick<
       typeof heartbeatRuns.$inferSelect,
-      "id" | "companyId" | "status" | "lastOutputAt" | "lastOutputSeq" | "lastOutputStream" | "processStartedAt" | "startedAt" | "createdAt"
+      "id" | "companyId" | "agentId" | "status" | "lastOutputAt" | "lastOutputSeq" | "lastOutputStream" | "processStartedAt" | "startedAt" | "createdAt"
     >,
     now = new Date(),
   ) {
     return recovery.buildRunOutputSilence(run, now);
+  }
+
+  function buildRunProcessDiagnostics(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "startedAt" | "processStartedAt">,
+  ) {
+    return buildHeartbeatRunProcessDiagnostics(run);
   }
 
   async function buildIssueGraphLivenessAutoRecoveryPreview(opts?: { lookbackHours?: number; now?: Date }) {
@@ -9014,6 +9038,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     reconcileProductivityReviews,
 
     buildRunOutputSilence,
+
+    buildRunProcessDiagnostics,
 
     tickTimers: async (now = new Date()) => {
       const allAgents = await db.select().from(agents);

@@ -230,6 +230,45 @@ describe("claude execute", () => {
     }
   });
 
+  it("emits a structured no_work line for unscoped timer fires before invoking Claude", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-exec-timer-no-work-"));
+    const { workspace, commandPath, restore } = await setupExecuteEnv(root);
+    const logs: Array<{ stream: "stdout" | "stderr"; chunk: string }> = [];
+    try {
+      await execute({
+        runId: "run-timer-no-work",
+        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: {
+          command: commandPath,
+          cwd: workspace,
+          promptTemplate: "Follow the heartbeat procedure.",
+        },
+        context: {
+          wakeSource: "timer",
+          wakeReason: "heartbeat_timer",
+        },
+        authToken: "tok",
+        onLog: async (stream, chunk) => {
+          logs.push({ stream, chunk });
+        },
+        onMeta: async () => {},
+      });
+
+      const firstStdout = logs.find((entry) => entry.stream === "stdout")?.chunk.trim();
+      expect(firstStdout).toBeTruthy();
+      expect(JSON.parse(firstStdout ?? "{}")).toMatchObject({
+        event: "no_work",
+        reason: "timer_no_scoped_work",
+        adapter: "claude_local",
+        runId: "run-timer-no-work",
+      });
+    } finally {
+      restore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("omits --append-system-prompt-file on a resumed session even when instructionsFile is set", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-exec-resume-"));
     const { workspace, commandPath, capturePath, restore } = await setupExecuteEnv(root);

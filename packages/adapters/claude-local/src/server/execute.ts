@@ -114,6 +114,23 @@ function resolveClaudeBillingType(env: Record<string, string>): "api" | "subscri
   return hasNonEmptyEnvValue(env, "ANTHROPIC_API_KEY") ? "api" : "subscription";
 }
 
+function hasNonEmptyContextValue(context: Record<string, unknown>, key: string): boolean {
+  const value = context[key];
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function shouldEmitTimerNoWorkEvent(context: Record<string, unknown>): boolean {
+  if (asString(context.wakeSource, "") !== "timer") return false;
+  return ![
+    "issueId",
+    "taskId",
+    "taskKey",
+    "commentId",
+    "wakeCommentId",
+    "approvalId",
+  ].some((key) => hasNonEmptyContextValue(context, key));
+}
+
 async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<ClaudeRuntimeConfig> {
   const { runId, agent, config, context, runtimeCommandSpec, executionTarget, authToken } = input;
   const onLog = input.onLog ?? (async () => {});
@@ -638,6 +655,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : `Claude exited with code ${proc.exitCode ?? -1}`;
   };
 
+  let timerNoWorkEventEmitted = false;
+  const emitTimerNoWorkEvent = async () => {
+    if (timerNoWorkEventEmitted || !shouldEmitTimerNoWorkEvent(context)) return;
+    timerNoWorkEventEmitted = true;
+    await onLog(
+      "stdout",
+      `${JSON.stringify({
+        event: "no_work",
+        reason: "timer_no_scoped_work",
+        adapter: "claude_local",
+        runId,
+      })}\n`,
+    );
+  };
+
   const runAttempt = async (resumeSessionId: string | null) => {
     const attemptInstructionsFilePath = resumeSessionId ? undefined : effectiveInstructionsFilePath;
     const args = buildClaudeArgs(resumeSessionId, attemptInstructionsFilePath);
@@ -663,6 +695,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         context,
       });
     }
+    await emitTimerNoWorkEvent();
 
     const proc = await runAdapterExecutionTargetProcess(runId, executionTarget, command, args, {
       cwd,

@@ -56,6 +56,7 @@ export interface HeartbeatRun {
   createdAt: Date;
   updatedAt: Date;
   outputSilence?: HeartbeatRunOutputSilence;
+  processDiagnostics?: HeartbeatRunProcessDiagnostics | null;
 }
 
 export type HeartbeatRunOutputSilenceLevel =
@@ -74,10 +75,19 @@ export interface HeartbeatRunOutputSilence {
   level: HeartbeatRunOutputSilenceLevel;
   suspicionThresholdMs: number;
   criticalThresholdMs: number;
+  thresholdSource?: "default" | "heartbeat_interval";
+  heartbeatIntervalSec?: number | null;
   snoozedUntil: Date | string | null;
   evaluationIssueId: string | null;
   evaluationIssueIdentifier: string | null;
   evaluationIssueAssigneeAgentId: string | null;
+}
+
+export interface HeartbeatRunProcessDiagnostics {
+  runStartedAt: Date | string | null;
+  processStartedAt: Date | string | null;
+  processStartedBeforeRun: boolean;
+  processStartedBeforeRunByMs: number | null;
 }
 
 export interface AgentWakeupSkipped {

@@ -20,7 +20,10 @@ import {
   ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS,
   heartbeatService,
 } from "../services/heartbeat.ts";
-import { recoveryService } from "../services/recovery/service.ts";
+import {
+  ACTIVE_RUN_OUTPUT_INTERVAL_CRITICAL_MULTIPLIER,
+  recoveryService,
+} from "../services/recovery/service.ts";
 import { getRunLogStore } from "../services/run-log-store.ts";
 
 const mockAdapterExecute = vi.hoisted(() =>
@@ -94,7 +97,13 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     await tempDb?.cleanup();
   });
 
-  async function seedRunningRun(opts: { now: Date; ageMs: number; withOutput?: boolean; logChunk?: string }) {
+  async function seedRunningRun(opts: {
+    now: Date;
+    ageMs: number;
+    withOutput?: boolean;
+    logChunk?: string;
+    agentRuntimeConfig?: Record<string, unknown>;
+  }) {
     const companyId = randomUUID();
     const managerId = randomUUID();
     const coderId = randomUUID();
@@ -131,7 +140,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
         reportsTo: managerId,
         adapterType: "codex_local",
         adapterConfig: {},
-        runtimeConfig: {},
+        runtimeConfig: opts.agentRuntimeConfig ?? {},
         permissions: {},
       },
     ]);
@@ -186,7 +195,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
 
   it("creates one medium-priority evaluation issue for a suspicious silent run", async () => {
     const now = new Date("2026-04-22T20:00:00.000Z");
-    const { companyId, managerId, runId } = await seedRunningRun({
+    const { companyId, managerId, coderId, runId } = await seedRunningRun({
       now,
       ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
     });
@@ -270,6 +279,53 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     expect(source?.status).toBe("blocked");
   });
 
+  it("uses heartbeat interval to bound the critical silence threshold", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const intervalSec = 30 * 60;
+    const criticalMs = intervalSec * 1000 * ACTIVE_RUN_OUTPUT_INTERVAL_CRITICAL_MULTIPLIER;
+    const { companyId, coderId, issueId, runId } = await seedRunningRun({
+      now,
+      ageMs: criticalMs + 60_000,
+      agentRuntimeConfig: {
+        heartbeat: {
+          enabled: true,
+          intervalSec,
+          maxConcurrentRuns: 1,
+        },
+      },
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.scanSilentActiveRuns({ now, companyId });
+
+    expect(result.created).toBe(1);
+    const [evaluation] = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
+    expect(evaluation?.priority).toBe("high");
+
+    await expect(heartbeat.buildRunOutputSilence({
+      id: runId,
+      agentId: coderId,
+      companyId,
+      status: "running",
+      lastOutputAt: null,
+      lastOutputSeq: 0,
+      lastOutputStream: null,
+      processStartedAt: new Date(now.getTime() - criticalMs - 60_000),
+      startedAt: new Date(now.getTime() - criticalMs - 60_000),
+      createdAt: new Date(now.getTime() - criticalMs - 60_000),
+    })).resolves.toMatchObject({
+      criticalThresholdMs: criticalMs,
+      thresholdSource: "heartbeat_interval",
+      heartbeatIntervalSec: intervalSec,
+    });
+
+    const [source] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(source?.status).toBe("blocked");
+  });
+
   it("skips snoozed runs and healthy noisy runs", async () => {
     const now = new Date("2026-04-22T20:00:00.000Z");
     const stale = await seedRunningRun({
@@ -294,12 +350,12 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     const noisyResult = await heartbeat.scanSilentActiveRuns({ now, companyId: noisy.companyId });
 
     expect(staleResult).toMatchObject({ created: 0, snoozed: 1 });
-    expect(noisyResult).toMatchObject({ scanned: 0, created: 0 });
+    expect(noisyResult).toMatchObject({ scanned: 1, created: 0, skipped: 1 });
   });
 
   it("records watchdog decisions through recovery owner authorization", async () => {
     const now = new Date("2026-04-22T20:00:00.000Z");
-    const { companyId, managerId, runId } = await seedRunningRun({
+    const { companyId, managerId, coderId, runId } = await seedRunningRun({
       now,
       ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
     });
@@ -339,6 +395,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     await expect(recovery.buildRunOutputSilence({
       id: runId,
       companyId,
+      agentId: coderId,
       status: "running",
       lastOutputAt: null,
       lastOutputSeq: 0,
@@ -403,6 +460,63 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       .from(issues)
       .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
     expect(evaluations.filter((issue) => !["done", "cancelled"].includes(issue.status))).toHaveLength(1);
+  });
+
+  it("suppresses recursive stale-run evaluations for a sole stale-run review assignment", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, managerId, runId, issuePrefix } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const first = await heartbeat.scanSilentActiveRuns({ now, companyId });
+    const evaluationIssueId = first.evaluationIssueIds[0];
+    expect(evaluationIssueId).toBeTruthy();
+
+    const reviewerRunId = randomUUID();
+    const reviewerRunStartedAt = new Date(now.getTime() - ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS - 60_000);
+    await db.insert(heartbeatRuns).values({
+      id: reviewerRunId,
+      companyId,
+      agentId: managerId,
+      status: "running",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt: reviewerRunStartedAt,
+      processStartedAt: reviewerRunStartedAt,
+      lastOutputAt: null,
+      lastOutputSeq: 0,
+      lastOutputStream: null,
+      contextSnapshot: { issueId: evaluationIssueId },
+      logBytes: 0,
+    });
+    await db
+      .update(issues)
+      .set({
+        status: "in_progress",
+        executionRunId: reviewerRunId,
+        updatedAt: reviewerRunStartedAt,
+      })
+      .where(eq(issues.id, evaluationIssueId));
+
+    const second = await heartbeat.scanSilentActiveRuns({ now, companyId });
+
+    expect(second.created).toBe(0);
+    expect(second.skipped).toBeGreaterThanOrEqual(1);
+    const evaluations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
+    expect(evaluations).toHaveLength(1);
+    expect(evaluations[0]?.identifier).toBe(`${issuePrefix}-2`);
+
+    const recursiveBlockers = await db
+      .select()
+      .from(issueRelations)
+      .where(and(eq(issueRelations.companyId, companyId), eq(issueRelations.relatedIssueId, evaluationIssueId)));
+    expect(recursiveBlockers).toHaveLength(0);
+    expect(evaluations[0]?.originId).toBe(runId);
   });
 
   it("rejects agent watchdog decisions using issues not bound to the target run", async () => {
