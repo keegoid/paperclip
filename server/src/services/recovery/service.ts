@@ -49,6 +49,7 @@ const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "ti
 export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
+export const ACTIVE_RUN_OUTPUT_INTERVAL_CRITICAL_MULTIPLIER = 2;
 const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
 const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.strandedIssueRecovery;
 const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiveRunEvaluation;
@@ -90,11 +91,49 @@ export type RunOutputSilenceSummary = {
   level: "not_applicable" | "ok" | "suspicious" | "critical" | "snoozed";
   suspicionThresholdMs: number;
   criticalThresholdMs: number;
+  thresholdSource: "default" | "heartbeat_interval";
+  heartbeatIntervalSec: number | null;
   snoozedUntil: Date | null;
   evaluationIssueId: string | null;
   evaluationIssueIdentifier: string | null;
   evaluationIssueAssigneeAgentId: string | null;
 };
+
+export type RunOutputSilenceThresholds = {
+  suspicionThresholdMs: number;
+  criticalThresholdMs: number;
+  thresholdSource: "default" | "heartbeat_interval";
+  heartbeatIntervalSec: number | null;
+};
+
+export function resolveRunOutputSilenceThresholds(runtimeConfig: unknown): RunOutputSilenceThresholds {
+  const heartbeat = parseObject(parseObject(runtimeConfig).heartbeat);
+  const rawIntervalSec = Math.floor(asNumber(heartbeat.intervalSec, 0));
+  const heartbeatIntervalSec = Number.isFinite(rawIntervalSec) && rawIntervalSec > 0 ? rawIntervalSec : null;
+  if (!heartbeatIntervalSec) {
+    return {
+      suspicionThresholdMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS,
+      criticalThresholdMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
+      thresholdSource: "default",
+      heartbeatIntervalSec: null,
+    };
+  }
+
+  const intervalCriticalThresholdMs = heartbeatIntervalSec * 1000 * ACTIVE_RUN_OUTPUT_INTERVAL_CRITICAL_MULTIPLIER;
+  const criticalThresholdMs = Math.min(
+    ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
+    Math.max(1, intervalCriticalThresholdMs),
+  );
+  return {
+    suspicionThresholdMs: Math.min(
+      ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS,
+      Math.max(1, Math.floor(criticalThresholdMs / 2)),
+    ),
+    criticalThresholdMs,
+    thresholdSource: "heartbeat_interval",
+    heartbeatIntervalSec,
+  };
+}
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
@@ -588,6 +627,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return startedAt ? Math.max(0, now.getTime() - startedAt.getTime()) : null;
   }
 
+  async function resolveRunOutputSilenceThresholdsForAgent(agentId: string) {
+    const [agent] = await db
+      .select({ runtimeConfig: agents.runtimeConfig })
+      .from(agents)
+      .where(eq(agents.id, agentId))
+      .limit(1);
+    return resolveRunOutputSilenceThresholds(agent?.runtimeConfig);
+  }
+
   async function latestActiveOutputQuietUntilDecision(companyId: string, runId: string, now = new Date()) {
     const [row] = await db
       .select()
@@ -632,7 +680,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   async function buildRunOutputSilence(
     run: Pick<
       typeof heartbeatRuns.$inferSelect,
-      "id" | "companyId" | "status" | "lastOutputAt" | "lastOutputSeq" | "lastOutputStream" | "processStartedAt" | "startedAt" | "createdAt"
+      "id" | "companyId" | "agentId" | "status" | "lastOutputAt" | "lastOutputSeq" | "lastOutputStream" | "processStartedAt" | "startedAt" | "createdAt"
     >,
     now = new Date(),
   ): Promise<RunOutputSilenceSummary> {
@@ -640,15 +688,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       latestActiveOutputQuietUntilDecision(run.companyId, run.id, now),
       findOpenStaleRunEvaluation(run.companyId, run.id),
     ]);
+    const thresholds = await resolveRunOutputSilenceThresholdsForAgent(run.agentId);
     const silenceStartedAt = silenceStartedAtForRun(run);
     const silenceAgeMs = run.status === "running" ? silenceAgeMsForRun(run, now) : null;
     const level = run.status !== "running"
       ? "not_applicable"
       : quietUntilDecision
         ? "snoozed"
-        : (silenceAgeMs ?? 0) >= ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS
+        : (silenceAgeMs ?? 0) >= thresholds.criticalThresholdMs
           ? "critical"
-          : (silenceAgeMs ?? 0) >= ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS
+          : (silenceAgeMs ?? 0) >= thresholds.suspicionThresholdMs
             ? "suspicious"
             : "ok";
     return {
@@ -660,8 +709,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       silenceStartedAt,
       silenceAgeMs,
       level,
-      suspicionThresholdMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS,
-      criticalThresholdMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
+      suspicionThresholdMs: thresholds.suspicionThresholdMs,
+      criticalThresholdMs: thresholds.criticalThresholdMs,
+      thresholdSource: thresholds.thresholdSource,
+      heartbeatIntervalSec: thresholds.heartbeatIntervalSec,
       snoozedUntil: quietUntilDecision?.snoozedUntil ?? null,
       evaluationIssueId: evaluation?.id ?? null,
       evaluationIssueIdentifier: evaluation?.identifier ?? null,
@@ -804,6 +855,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     sourceIssue: typeof issues.$inferSelect | null;
     prefix: string;
     evidence: Awaited<ReturnType<typeof collectStaleRunEvidence>>;
+    thresholds: RunOutputSilenceThresholds;
     level: "suspicious" | "critical";
     now: Date;
   }) {
@@ -839,7 +891,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       `- Last output at: ${input.run.lastOutputAt?.toISOString() ?? "none recorded"}`,
       `- Last output sequence: ${input.run.lastOutputSeq ?? 0}`,
       `- Silent for: ${formatDuration(input.evidence.silenceAgeMs)}`,
-      `- Thresholds: suspicious after ${formatDuration(ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS)}, critical after ${formatDuration(ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS)}`,
+      `- Thresholds: suspicious after ${formatDuration(input.thresholds.suspicionThresholdMs)}, critical after ${formatDuration(input.thresholds.criticalThresholdMs)} (${input.thresholds.thresholdSource}${input.thresholds.heartbeatIntervalSec ? `, heartbeat interval ${input.thresholds.heartbeatIntervalSec}s` : ""})`,
       `- Process metadata: pid \`${input.run.processPid ?? "unknown"}\`, process group \`${input.run.processGroupId ?? "unknown"}\`, in-memory handle \`${runningProcesses.has(input.run.id) ? "yes" : "no"}\``,
       "",
       "## Last Output Excerpt",
@@ -927,6 +979,30 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return true;
   }
 
+  async function shouldSuppressRecursiveStaleRunEvaluation(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    sourceIssue: typeof issues.$inferSelect | null;
+  }) {
+    if (!input.sourceIssue) return false;
+    if (input.sourceIssue.originKind !== STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND) return false;
+    if (input.sourceIssue.assigneeAgentId !== input.run.agentId) return false;
+
+    const activeAssignments = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, input.run.companyId),
+          eq(issues.assigneeAgentId, input.run.agentId),
+          inArray(issues.status, ["todo", "in_progress", "in_review"]),
+          isNull(issues.hiddenAt),
+        ),
+      )
+      .limit(2);
+
+    return activeAssignments.length === 1 && activeAssignments[0]?.id === input.sourceIssue.id;
+  }
+
   async function createOrUpdateStaleRunEvaluation(input: {
     run: typeof heartbeatRuns.$inferSelect;
     now: Date;
@@ -934,6 +1010,28 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     const runningAgent = await getAgent(input.run.agentId);
     if (!runningAgent || runningAgent.companyId !== input.run.companyId) return { kind: "skipped" as const };
     const sourceIssue = await resolveStaleRunSourceIssue(input.run);
+    if (await shouldSuppressRecursiveStaleRunEvaluation({ run: input.run, sourceIssue })) {
+      await logActivity(db, {
+        companyId: input.run.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: input.run.agentId,
+        runId: input.run.id,
+        action: "heartbeat.output_stale_recursive_guard",
+        entityType: "heartbeat_run",
+        entityId: input.run.id,
+        details: {
+          source: "recovery.scan_silent_active_runs",
+          sourceIssueId: sourceIssue?.id ?? null,
+          sourceIssueIdentifier: sourceIssue?.identifier ?? null,
+          originKind: sourceIssue?.originKind ?? null,
+        },
+      });
+      return { kind: "skipped" as const };
+    }
+    const thresholds = resolveRunOutputSilenceThresholds(runningAgent.runtimeConfig);
+    const silenceAgeMs = silenceAgeMsForRun(input.run, input.now);
+    if ((silenceAgeMs ?? 0) < thresholds.suspicionThresholdMs) return { kind: "skipped" as const };
     const prefix = await getCompanyIssuePrefix(input.run.companyId);
     const evidence = await collectStaleRunEvidence({
       run: input.run,
@@ -942,7 +1040,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       prefix,
       now: input.now,
     });
-    const level = (evidence.silenceAgeMs ?? 0) >= ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS ? "critical" : "suspicious";
+    const level = (evidence.silenceAgeMs ?? 0) >= thresholds.criticalThresholdMs ? "critical" : "suspicious";
     const existing = await findOpenStaleRunEvaluation(input.run.companyId, input.run.id);
     if (existing) {
       if (level === "critical" && existing.priority !== "high") {
@@ -954,6 +1052,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           "",
           `- Run: \`${input.run.id}\``,
           `- Silent for: ${formatDuration(evidence.silenceAgeMs)}`,
+          `- Critical threshold: ${formatDuration(thresholds.criticalThresholdMs)}`,
           `- Last output at: ${input.run.lastOutputAt?.toISOString() ?? "none recorded"}`,
         ].join("\n"), { runId: input.run.id });
         await ensureSourceIssueBlockedByStaleEvaluation({
@@ -980,6 +1079,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       sourceIssue,
       prefix,
       evidence,
+      thresholds,
       level,
       now: input.now,
     });
@@ -1058,7 +1158,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
   async function scanSilentActiveRuns(opts?: { now?: Date; companyId?: string }) {
     const now = opts?.now ?? new Date();
-    const suspicionBefore = new Date(now.getTime() - ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS);
     const candidates = await db
       .select()
       .from(heartbeatRuns)
@@ -1066,10 +1165,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         and(
           opts?.companyId ? eq(heartbeatRuns.companyId, opts.companyId) : undefined,
           eq(heartbeatRuns.status, "running"),
-          sql`coalesce(${heartbeatRuns.lastOutputAt}, ${heartbeatRuns.processStartedAt}, ${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) <= ${suspicionBefore.toISOString()}::timestamptz`,
+          sql`coalesce(${heartbeatRuns.lastOutputAt}, ${heartbeatRuns.processStartedAt}, ${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) is not null`,
         ),
       )
-      .orderBy(asc(heartbeatRuns.createdAt))
+      .orderBy(sql`coalesce(${heartbeatRuns.lastOutputAt}, ${heartbeatRuns.processStartedAt}, ${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) asc`)
       .limit(100);
 
     const result = {

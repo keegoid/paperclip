@@ -2943,7 +2943,12 @@ export function agentRoutes(
     const retryExhaustedReason = await heartbeat.getRetryExhaustedReason(runId);
     res.json(
       redactCurrentUserValue(
-        { ...run, retryExhaustedReason, outputSilence: await heartbeat.buildRunOutputSilence(run) },
+        {
+          ...run,
+          retryExhaustedReason,
+          outputSilence: await heartbeat.buildRunOutputSilence(run),
+          processDiagnostics: heartbeat.buildRunProcessDiagnostics(run),
+        },
         await getCurrentUserRedactionOptions(),
       ),
     );
