@@ -189,6 +189,14 @@ describe("codex execute", () => {
       context: { wakeSource: "timer", wakeReason: "heartbeat_timer", issueId: "issue-1" },
     },
     {
+      name: "a scoped timer issue wake with a numeric issue id",
+      context: { wakeSource: "timer", wakeReason: "heartbeat_timer", issueId: 42 },
+    },
+    {
+      name: "a timer wake with an unclassified scope-shaped key",
+      context: { wakeSource: "timer", wakeReason: "heartbeat_timer", pullRequestId: "pr-9" },
+    },
+    {
       name: "a non-timer wake source",
       context: { wakeSource: "comment", wakeReason: "issue_commented" },
     },

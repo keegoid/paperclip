@@ -81,23 +81,37 @@ function hasNonEmptyEnvValue(env: Record<string, string>, key: string): boolean 
 
 function hasNonEmptyContextValue(context: Record<string, unknown>, key: string): boolean {
   const value = context[key];
-  return typeof value === "string" && value.trim().length > 0;
+  return hasMeaningfulContextValue(value);
 }
+
+function hasMeaningfulContextValue(value: unknown): boolean {
+  if (typeof value === "string") return value.trim().length > 0;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value === "bigint") return true;
+  if (typeof value === "boolean") return value;
+  if (Array.isArray(value)) return value.some((entry) => hasMeaningfulContextValue(entry));
+  if (typeof value === "object" && value !== null) return Object.keys(value).length > 0;
+  return false;
+}
+
+const TIMER_NO_WORK_SAFE_CONTEXT_KEYS = new Set([
+  "modelProfile",
+  "now",
+  "paperclipModelProfile",
+  "reason",
+  "source",
+  "wakeReason",
+  "wakeSource",
+  "wakeTriggerDetail",
+]);
 
 function shouldEmitTimerNoWorkEvent(context: Record<string, unknown>): boolean {
   if (asString(context.wakeSource, "") !== "timer") return false;
   // Retry runs can preserve the original timer wakeSource while running under an automation reason.
   if (asString(context.wakeReason, "") !== "heartbeat_timer") return false;
-  return ![
-    "issueId",
-    "taskId",
-    "taskKey",
-    "commentId",
-    "wakeCommentId",
-    "approvalId",
-    "retryOfRunId",
-    "retryReason",
-  ].some((key) => hasNonEmptyContextValue(context, key));
+  return Object.entries(context).every(
+    ([key]) => TIMER_NO_WORK_SAFE_CONTEXT_KEYS.has(key) || !hasNonEmptyContextValue(context, key),
+  );
 }
 
 function resolveCodexBillingType(env: Record<string, string>): "api" | "subscription" {
