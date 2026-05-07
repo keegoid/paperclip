@@ -355,6 +355,104 @@ describe("IssueChatThread", () => {
     });
   });
 
+  it("renders the composer in planning mode when the issue is in planning mode", () => {
+    const root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <IssueChatThread
+            comments={[]}
+            linkedRuns={[]}
+            timelineEvents={[]}
+            liveRuns={[]}
+            issueWorkMode="planning"
+            onWorkModeChange={() => {}}
+            onAdd={async () => {}}
+            enableLiveTranscriptPolling={false}
+          />
+        </MemoryRouter>,
+      );
+    });
+
+    const composer = container.querySelector('[data-testid="issue-chat-composer"]');
+    expect(composer).not.toBeNull();
+    expect(composer?.getAttribute("data-pending-work-mode")).toBe("planning");
+    expect(composer?.className).toContain("amber");
+
+    const toggle = container.querySelector(
+      '[data-testid="issue-chat-composer-work-mode-toggle"]',
+    );
+    expect(toggle).not.toBeNull();
+    expect(toggle?.getAttribute("data-pending-work-mode")).toBe("planning");
+    expect(toggle?.textContent).toContain("Planning");
+
+    act(() => {
+      root.unmount();
+    });
+  });
+
+  it("hides the planning chip on a standard issue and exposes the toggle through the menu", () => {
+    const root = createRoot(container);
+    const onWorkModeChange = vi.fn();
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <IssueChatThread
+            comments={[]}
+            linkedRuns={[]}
+            timelineEvents={[]}
+            liveRuns={[]}
+            issueWorkMode="standard"
+            onWorkModeChange={onWorkModeChange}
+            onAdd={async () => {}}
+            enableLiveTranscriptPolling={false}
+          />
+        </MemoryRouter>,
+      );
+    });
+
+    expect(
+      container.querySelector('[data-testid="issue-chat-composer-work-mode-toggle"]'),
+    ).toBeNull();
+    const composer = container.querySelector('[data-testid="issue-chat-composer"]');
+    expect(composer?.getAttribute("data-pending-work-mode")).toBe("standard");
+    expect(composer?.className).not.toContain("amber");
+
+    const menuTrigger = container.querySelector(
+      '[data-testid="issue-chat-composer-work-mode-menu"]',
+    ) as HTMLButtonElement | null;
+    expect(menuTrigger).not.toBeNull();
+    act(() => {
+      menuTrigger?.click();
+    });
+
+    const menuItem = document.querySelector(
+      '[data-testid="issue-chat-composer-work-mode-menu-toggle"]',
+    ) as HTMLButtonElement | null;
+    expect(menuItem).not.toBeNull();
+    expect(menuItem?.textContent).toContain("Switch to planning");
+
+    act(() => {
+      menuItem?.click();
+    });
+
+    expect(onWorkModeChange).not.toHaveBeenCalled();
+    expect(composer?.getAttribute("data-pending-work-mode")).toBe("planning");
+    expect(composer?.className).toContain("amber");
+
+    const visibleChip = container.querySelector(
+      '[data-testid="issue-chat-composer-work-mode-toggle"]',
+    );
+    expect(visibleChip).not.toBeNull();
+    expect(visibleChip?.textContent).toContain("Planning");
+
+    act(() => {
+      root.unmount();
+    });
+  });
+
   it("virtualizes long merged threads so only a windowed slice mounts", () => {
     const root = createRoot(container);
     const totalMergedRows =
@@ -845,6 +943,9 @@ describe("IssueChatThread", () => {
       authorAgentId: "agent-perf-codex",
       authorUserId: null,
       body: "Older loaded comment",
+      authorType: "agent" as const,
+      presentation: null,
+      metadata: null,
       createdAt: new Date("2026-04-06T12:00:00.000Z"),
       updatedAt: new Date("2026-04-06T12:00:00.000Z"),
     };
@@ -1065,6 +1166,9 @@ describe("IssueChatThread", () => {
       authorAgentId: "agent-1",
       authorUserId: null,
       body: "Agent summary with **markdown**",
+      authorType: "agent" as const,
+      presentation: null,
+      metadata: null,
       createdAt: new Date("2026-04-06T12:00:00.000Z"),
       updatedAt: new Date("2026-04-06T12:00:00.000Z"),
     }];
@@ -1144,6 +1248,9 @@ describe("IssueChatThread", () => {
               authorAgentId: null,
               authorUserId: "local-board",
               body: "Please continue validation.",
+              authorType: "user",
+              presentation: null,
+              metadata: null,
               followUpRequested: true,
               createdAt: new Date("2026-03-11T10:00:00.000Z"),
               updatedAt: new Date("2026-03-11T10:00:00.000Z"),
@@ -1597,6 +1704,9 @@ describe("IssueChatThread", () => {
               authorAgentId: "agent-1",
               authorUserId: null,
               body: "Agent summary",
+              authorType: "agent",
+              presentation: null,
+              metadata: null,
               createdAt: new Date("2026-04-06T12:00:00.000Z"),
               updatedAt: new Date("2026-04-06T12:00:00.000Z"),
             }]}
@@ -1683,6 +1793,9 @@ describe("IssueChatThread", () => {
               authorAgentId: null,
               authorUserId: "user-1",
               body: "Need a quick update",
+              authorType: "user",
+              presentation: null,
+              metadata: null,
               queueState: "queued",
               queueReason: "hold",
               createdAt: new Date("2026-04-06T12:00:00.000Z"),
@@ -1712,6 +1825,9 @@ describe("IssueChatThread", () => {
               authorAgentId: null,
               authorUserId: "user-1",
               body: "Queue behind active run",
+              authorType: "user",
+              presentation: null,
+              metadata: null,
               queueState: "queued",
               queueReason: "active_run",
               createdAt: new Date("2026-04-06T12:01:00.000Z"),
@@ -2056,6 +2172,9 @@ describe("IssueChatThread", () => {
               authorAgentId: null,
               authorUserId: "user-1",
               body: "hello",
+              authorType: "user",
+              presentation: null,
+              metadata: null,
               createdAt: new Date("2026-04-22T12:00:00.000Z"),
               updatedAt: new Date("2026-04-22T12:00:00.000Z"),
             }]}
